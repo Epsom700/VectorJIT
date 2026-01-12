@@ -1,0 +1,11 @@
+# Minimal Python dependencies for VectorJIT
+# numpy is required by the library and tests/benchmarks
+numpy>=1.24.0
+
+# Test / benchmark tooling (optional)
+pytest>=7.0.0
+pytest-benchmark>=4.0.0
+
+# Notes:
+# - The project also generates and compiles C/C++ code (OpenMP/NEON). On macOS you may
+#   need to install libomp (e.g. `brew install libomp`) and a C++ toolchain.
