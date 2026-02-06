@@ -28,3 +28,9 @@ dist/
 *~
 .vscode/
 .idea/
+
+
+logs.txt
+logs/
+
+clear_cache.py

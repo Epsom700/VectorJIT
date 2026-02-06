@@ -44,3 +44,17 @@ class AdamOptimizer:
             
             # Update parameters: w = w - lr * m_hat / (sqrt(v_hat) + eps)
             node.data -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+
+    def clip_gradients(self, max_norm: float = 1.0):
+        """Global Gradient Norm Clipping to prevent explosion."""
+        total_norm = 0.0
+        for p in self.parameters:
+            if p.node.grad is not None:
+                total_norm += np.sum(p.node.grad ** 2)
+        total_norm = np.sqrt(total_norm)
+        
+        clip_coef = max_norm / (total_norm + 1e-6)
+        if clip_coef < 1:
+            for p in self.parameters:
+                if p.node.grad is not None:
+                    p.node.grad *= clip_coef

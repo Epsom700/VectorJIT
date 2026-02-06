@@ -59,7 +59,6 @@ class Tensor:
         return ptr_array, kept_references
 
     def forward(self) -> None:
-    # 1. Topological sort
         nodes_to_compute = []
         visited = set()
         def _topo(n):
@@ -69,13 +68,24 @@ class Tensor:
                 nodes_to_compute.append(n)
         _topo(self.node)
 
-        # 2. Compute each node
         for node in nodes_to_compute:
+            if node.grad is not None:
+                node.grad.fill(0.0)
             if node.op_type == Operators.INPUT:
-                # INPUT nodes should already have data from constructor
                 if node.data is None:
                     raise RuntimeError(f"INPUT node {node.name} has no data!")
                 continue
+
+            # HANDLE RESHAPE in Python
+            if node.op_type == Operators.RESHAPE:
+                inp_data = node.inputs[0].data
+                if inp_data is None:
+                    raise RuntimeError(f"Input to RESHAPE has no data!")
+                node.data = inp_data.reshape(node.shape)
+                continue
+            
+            if node.data is None:
+                node.data = np.zeros(node.shape, dtype=np.float32)
             
             # Allocate output buffer
             if node.data is None:
@@ -89,24 +99,29 @@ class Tensor:
             compiler = Compiler()
             lib = compiler.jit_compile(node)
             
-            if node.op_type in (Operators.MATMUL, Operators.LAYERNORM, Operators.SOFTMAX_CROSS_ENTROPY):
-                # Fused ops: [output, input1, input2, ...]
+            if node.op_type in (Operators.MATMUL, Operators.LAYERNORM, Operators.SOFTMAX_CROSS_ENTROPY, Operators.GELU, Operators.MHA):
                 all_data = [node.data] + [inp.data for inp in node.inputs]
                 vars_ptr, _keep = self._prepare_ptr_array(all_data)
-                
-                # Pass batch size (first dimension)
+                lib.compute(vars_ptr, node.shape[0])
+            elif node.op_type == Operators.FFN:
+                X = node.inputs[0].data
+                W1 = node.inputs[1].data
+                b1 = node.inputs[2].data
+                W2 = node.inputs[3].data
+                b2 = node.inputs[4].data
+                if not W2.flags['C_CONTIGUOUS'] or W2.shape[0] == node.attributes['hidden_dim']:
+                    W2_T = np.ascontiguousarray(W2.T)
+                else:
+                    W2_T = W2
+                all_data = [node.data, X, W1, b1, W2_T, b2]
+                vars_ptr, _keep = self._prepare_ptr_array(all_data)
                 lib.compute(vars_ptr, node.shape[0])
             else:
-                # Element-wise chain
                 chain_nodes = compiler.execution_order
-    
                 for n in chain_nodes:
                     if n.data is None:
                         n.data = np.zeros(n.shape, dtype=np.float32)
-                
                 vars_ptr, _keep = self._prepare_ptr_array([n.data for n in chain_nodes])
-                
-                # Pass total elements
                 total_elements = int(np.prod(node.shape))
                 lib.compute(vars_ptr, total_elements)
 
@@ -125,28 +140,81 @@ class Tensor:
         for node in reversed(nodes):
             if not node.requires_grad or node.op_type == Operators.INPUT: continue
             
+            for inp in node.inputs:
+                if inp.grad is None: inp.grad = np.zeros(inp.shape, dtype=np.float32)
+            
+            if hasattr(node, 'backward_fn') and node.backward_fn is not None:
+                saved = getattr(node, 'saved_tensors', None)
+                node.backward_fn(node.grad, saved)
+                continue
+            
+            # HANDLE RESHAPE in Backward
+            if node.op_type == Operators.RESHAPE:
+                node.inputs[0].grad += node.grad.reshape(node.inputs[0].shape)
+                continue
+
             compiler = Compiler()
             lib, func_name = compiler.jit_compile_backward(node)
             func = getattr(lib, func_name)
-
-            # Ensure input grads exist
-            for inp in node.inputs:
-                if inp.grad is None: inp.grad = np.zeros(inp.shape, dtype=np.float32)
-
-            if func_name == "loss_backward":
+            if node.op_type == Operators.FFN:
+                X = node.inputs[0]
+                W1 = node.inputs[1]
+                b1 = node.inputs[2]
+                W2 = node.inputs[3]
+                b2 = node.inputs[4]
+                if not W2.grad.flags['C_CONTIGUOUS']:
+                    W2.grad = np.ascontiguousarray(W2.grad)
+                g_p, _k1 = self._prepare_ptr_array([
+                    X.grad, W1.grad, b1.grad, W2.grad, b2.grad
+                ])
+                v_p, _k2 = self._prepare_ptr_array([
+                    X.data, W1.data, b1.data, 
+                    np.ascontiguousarray(W2.data.T), b2.data
+                ])
+                grad_out_ptr = node.grad.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+                func(g_p, v_p, node.shape[0], grad_out_ptr)
+            elif func_name == "loss_backward":
                 g_p, _k1 = self._prepare_ptr_array([node.inputs[0].grad])
                 v_p, _k2 = self._prepare_ptr_array([node.inputs[0].data, node.inputs[1].data])
-                func(g_p, v_p, node.shape[0], node.grad.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
+                # Pass batch size (dim 0) explicitly
+                B = node.inputs[0].shape[0] if len(node.inputs[0].shape) == 2 else node.inputs[0].shape[0] * node.inputs[0].shape[1]
+                func(g_p, v_p, B, node.grad.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
+            # ... [Rest of cases same] ...
             elif node.op_type == Operators.MATMUL:
-                g_p, _k1 = self._prepare_ptr_array([node.inputs[0].grad, node.inputs[1].grad])
-                v_p, _k2 = self._prepare_ptr_array([node.inputs[0].data, node.inputs[1].data])
+                 g_p, _k1 = self._prepare_ptr_array([node.inputs[0].grad, node.inputs[1].grad])
+                 v_p, _k2 = self._prepare_ptr_array([node.inputs[0].data, node.inputs[1].data])
+                 func(g_p, v_p, node.shape[0], node.grad.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
+            elif node.op_type == Operators.MHA:
+                 g_p, _k1 = self._prepare_ptr_array([node.inputs[0].grad, node.inputs[1].grad, node.inputs[2].grad])
+                 v_p, _k2 = self._prepare_ptr_array([node.inputs[0].data, node.inputs[1].data, node.inputs[2].data])
+                 grad_out_ptr = node.grad.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+                 func(g_p, v_p, node.shape[0], grad_out_ptr)
+            elif node.op_type == Operators.LAYERNORM:
+                x_inp, gamma_inp, beta_inp = node.inputs[0], node.inputs[1], node.inputs[2]
+                if len(node.shape) == 2:
+                    B, F = node.shape
+                else:
+                    B = node.shape[0] * node.shape[1]
+                    F = node.shape[2]
+                func(
+                    x_inp.grad.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    gamma_inp.grad.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    beta_inp.grad.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    node.grad.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    x_inp.data.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    gamma_inp.data.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    ctypes.c_int(B),
+                    ctypes.c_int(F)
+                )
+            elif node.op_type == Operators.GELU:
+                g_p, _k1 = self._prepare_ptr_array([node.inputs[0].grad])
+                v_p, _k2 = self._prepare_ptr_array([node.inputs[0].data])
                 func(g_p, v_p, node.shape[0], node.grad.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
             else:
                 chain = compiler.execution_order
                 g_p, _k1 = self._prepare_ptr_array([n.grad for n in chain])
                 v_p, _k2 = self._prepare_ptr_array([n.data for n in chain])
                 func(g_p, v_p, node.shape[0], node.grad.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
-
 
     def zero_grad(self) -> None:
         if self.node.grad is not None:
@@ -317,7 +385,62 @@ class Tensor:
 
             new_node.backward_fn = backward_fn
         return Tensor(node=new_node)
+
+    def mha(self, num_heads: int, key: 'Tensor', value: 'Tensor') -> 'Tensor':
+        # Output shape is same as query shape (B, S, E)
+        new_node = Node(Operators.MHA, 
+                        inputs=[self.node, key.node, value.node], 
+                        attributes={'num_heads': num_heads},
+                        shape=self.shape)
+        if self.requires_grad or key.requires_grad or value.requires_grad:
+            new_node.requires_grad = True
+            
+            def backward_fn(grad_output, saved_tensors):
+                    pass
+
+            new_node.backward_fn = backward_fn
+        
+        return Tensor(node=new_node)
     
+    def gelu(self) -> 'Tensor': 
+        new_shape = self.shape
+        new_node = Node(Operators.GELU, inputs=[self.node], shape=new_shape, requires_grad=self.requires_grad)
+
+        if new_node.requires_grad:
+            new_node.saved_tensors = [self]
+            def backward_fn(grad_output, saved_tensors):
+                pass
+
+            new_node.backward_fn = backward_fn
+        return Tensor(node=new_node)
+    
+    def ffn(self, W1: 'Tensor', b1: 'Tensor', W2: 'Tensor', b2: 'Tensor', hidden_dim: int) -> 'Tensor': 
+        # The FFN Super-Kernel needs all 5 tensors to compute in one pass
+        new_node = Node(
+            Operators.FFN, 
+            inputs=[self.node, W1.node, b1.node, W2.node, b2.node], 
+            attributes={'hidden_dim': hidden_dim}, 
+            shape=self.shape, 
+            requires_grad=self.requires_grad or W1.requires_grad or W2.requires_grad
+        )
+        
+        if new_node.requires_grad:
+            # We'll implement the fused C++ backward dispatcher here next
+            def backward_fn(grad_output, saved_tensors):
+                pass
+            new_node.backward_fn = backward_fn
+        
+        return Tensor(node=new_node)
+
+    def reshape(self, new_shape: List[int]) -> 'Tensor':
+        new_node = Node(Operators.RESHAPE, inputs=[self.node], shape=tuple(new_shape), requires_grad=self.requires_grad)
+        return Tensor(node=new_node)
+    
+    def flatten(self) -> 'Tensor':
+        total = np.prod(self.shape)
+        dim1 = total // self.shape[0]
+        return self.reshape([self.shape[0], dim1])
+
     def sigmoid(self) -> 'Tensor':
         new_node = Node(Operators.SIGMOID, inputs=[self.node])
         return Tensor(node=new_node)
@@ -337,10 +460,7 @@ class Tensor:
     def maxpool2d(self, pool_size: int, stride: int = 2, padding: str = 'valid') -> 'Tensor': 
         new_node = Node(Operators.MAXPOOL2D, inputs=[self.node])
         return Tensor(node=new_node)
-    
-    def flatten(self) -> 'Tensor':
-        new_node = Node(Operators.FLATTEN, inputs=[self.node])
-        return Tensor(node=new_node)
+
     
     def dense(self, units: int, activation: Optional[str] = None) -> 'Tensor':
         new_node = Node(Operators.DENSE, inputs=[self.node])
@@ -357,9 +477,6 @@ class Tensor:
         new_node = Node(Operators.BATCHNORM, inputs=[self.node])
         return Tensor(node=new_node)
 
-    def reshape(self, new_shape: List[int]) -> 'Tensor':
-        new_node = Node(Operators.RESHAPE, inputs=[self.node])
-        return Tensor(node=new_node)
 
     def __concat__(self, other: 'Tensor', axis: int = 0) -> 'Tensor': 
         new_node = Node(Operators.CONCAT, inputs=[self.node, other.node], attributes={'axis': axis})

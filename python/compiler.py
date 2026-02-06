@@ -1,3 +1,5 @@
+import code
+from platform import node
 from .ops import Node, Operators
 from typing import List, Optional, Set, Dict
 import subprocess
@@ -338,7 +340,6 @@ class Compiler:
             
             self.code_buffer.append(f"        vars[{idx}][i] = {var_name};")
 
-    
     def compile_backward(self, root_node: Node) -> str: 
         self.visited_nodes.clear()
         self.execution_order.clear()
@@ -562,7 +563,13 @@ class Compiler:
     
     def compile_LayerNorm_SIMD(self, node: Node) -> str: 
         eps = node.attributes.get("eps", 1e-5)
-        B, F = node.shape
+        # Handle both 2D (B, F) and 3D (B, S, E) shapes
+        if len(node.shape) == 2:
+            B, F = node.shape
+        else:
+            # For 3D: flatten B*S into batch dimension
+            B = node.shape[0] * node.shape[1]
+            F = node.shape[2]
         code = [
             "#include <arm_neon.h>", 
             "#include <cmath>", 
@@ -607,36 +614,25 @@ class Compiler:
     
     def compile_LayerNorm_Backend_SIMD(self, node: Node)-> str: 
         eps = node.attributes.get('eps', 1e-5)
-        B, F = node.shape
+        if len(node.shape) == 2: B, F = node.shape
+        else: B = node.shape[0] * node.shape[1]; F = node.shape[2]
         vector_limit = F - (F % 4)
-
         code = [
-            "#include <arm_neon.h>", 
-            "#include <cmath>", 
-            "#include <omp.h>", 
-            "", 
-            "extern \"C\" void layernorm_backward(float* grad_x, float* grad_gamma, float* grad_beta, float* grad_out, float* x, float* gamma, int B, int F){", 
-            "", 
+            "#include <arm_neon.h>", "#include <cmath>", "#include <omp.h>", 
+            "", "extern \"C\" void layernorm_backward(float* grad_x, float* grad_gamma, float* grad_beta, float* grad_out, float* x, float* gamma, int B, int F){", 
             "   #pragma omp parallel for", 
             "   for (int i =0; i < " + str(B)+"; ++i ){", 
-            "       float row_sum_grad = 0.0f;", 
-            "       float row_sum_grad_xhat = 0.0f;",
+            "       float row_sum_grad = 0.0f; float row_sum_grad_xhat = 0.0f;",
             "       float row_sum_x = 0.0f; float row_sum_xsq = 0.0f;", 
             "       int offset = i * F;",
-            "", 
             "       for (int j = 0; j < " + str(F) + "; ++j){", 
-            "           float val = x[offset + j];", 
-            "           row_sum_x += val; row_sum_xsq +=val*val;", 
+            "           float val = x[offset + j]; row_sum_x += val; row_sum_xsq +=val*val;", 
             "       }", 
             f"      float mean = row_sum_x/{F};", 
             f"      float var = (row_sum_xsq/{F})-(mean*mean);", 
             f"      float inv_std = 1.0f / sqrtf(var + {eps}f);", 
-            "", 
-            "       float32x4_t  v_sum_grad = vdupq_n_f32(0.0f);", 
-            "       float32x4_t  v_sum_grad_xhat = vdupq_n_f32(0.0f);", 
-            "       float32x4_t  v_mean = vdupq_n_f32(mean);", 
-            "       float32x4_t v_inv_std = vdupq_n_f32(inv_std);", 
-            "", 
+            "       float32x4_t  v_sum_grad = vdupq_n_f32(0.0f); float32x4_t  v_sum_grad_xhat = vdupq_n_f32(0.0f);", 
+            "       float32x4_t  v_mean = vdupq_n_f32(mean); float32x4_t v_inv_std = vdupq_n_f32(inv_std);", 
             "       int j =0; ", 
             "       for(; j < "+str(vector_limit)+"; j +=4){", 
             "           float32x4_t v_x = vld1q_f32(&x[offset + j]);",
@@ -644,31 +640,68 @@ class Compiler:
             "           float32x4_t v_x_hat = vmulq_f32(vsubq_f32(v_x, v_mean), v_inv_std);", 
             "           v_sum_grad = vaddq_f32(v_sum_grad, v_g_out);", 
             "           v_sum_grad_xhat = vfmaq_f32(v_sum_grad_xhat, v_g_out, v_x_hat);", 
+            "           #pragma omp atomic",
+            "           grad_gamma[j] += vgetq_lane_f32(vmulq_f32(v_g_out, v_x_hat), 0);",
+            "           #pragma omp atomic",
+            "           grad_gamma[j+1] += vgetq_lane_f32(vmulq_f32(v_g_out, v_x_hat), 1);",
+            "           #pragma omp atomic",
+            "           grad_gamma[j+2] += vgetq_lane_f32(vmulq_f32(v_g_out, v_x_hat), 2);",
+            "           #pragma omp atomic",
+            "           grad_gamma[j+3] += vgetq_lane_f32(vmulq_f32(v_g_out, v_x_hat), 3);",
+            "           #pragma omp atomic",
+            "           grad_beta[j] += vgetq_lane_f32(v_g_out, 0);",
+            "           #pragma omp atomic",
+            "           grad_beta[j+1] += vgetq_lane_f32(v_g_out, 1);",
+            "           #pragma omp atomic",
+            "           grad_beta[j+2] += vgetq_lane_f32(v_g_out, 2);",
+            "           #pragma omp atomic",
+            "           grad_beta[j+3] += vgetq_lane_f32(v_g_out, 3);",
             "       }", 
             "       row_sum_grad = vaddvq_f32(v_sum_grad);", 
             "       row_sum_grad_xhat = vaddvq_f32(v_sum_grad_xhat);",
+            "       for (; j < {F}; ++j) {{",
+            "           float val = x[offset + j]; float g_out = grad_out[offset+j];",
+            "           float x_hat = (val - mean) * inv_std;",
+            "           row_sum_grad += g_out; row_sum_grad_xhat += g_out * x_hat;",
+            "           #pragma omp atomic",
+            "           grad_gamma[j] += g_out * x_hat;",
+            "           #pragma omp atomic",
+            "           grad_beta[j] += g_out;",
+            "       }",
             "       float32x4_t v_s_grad = vdupq_n_f32(row_sum_grad);", 
             "       float32x4_t v_s_grad_xhat = vdupq_n_f32(row_sum_grad_xhat);", 
-            f"      float32x4_t v_F_inv = vdupq_n_f32(1.0f/{F});", 
+            f"      float32x4_t v_F_inv = vdupq_n_f32(1.0f/{F}.0f);", 
             "       j = 0;", 
             f"      for (; j < {vector_limit}; j += 4) {{",
             "            float32x4_t v_x = vld1q_f32(&x[offset + j]);",
             "            float32x4_t v_g_out = vld1q_f32(&grad_out[offset + j]);",
             "            float32x4_t v_gamma = vld1q_f32(&gamma[j]);",
             "            float32x4_t v_x_hat = vmulq_f32(vsubq_f32(v_x, v_mean), v_inv_std);",
-            "",
-            "            // Formula: (gamma * inv_std / F) * (F * grad_out - sum_grad - x_hat * sum_grad_xhat)",
             f"            float32x4_t v_term1 = vmulq_f32(vmulq_f32(v_gamma, v_inv_std), v_F_inv);",
-            f"            float32x4_t v_term2 = vsubq_f32(vsubq_f32(vmulq_f32(vdupq_n_f32({F}), v_g_out), v_s_grad), vmulq_f32(v_x_hat, v_s_grad_xhat));",
+            f"            float32x4_t v_term2 = vsubq_f32(vsubq_f32(vmulq_f32(vdupq_n_f32({F}.0f), v_g_out), v_s_grad), vmulq_f32(v_x_hat, v_s_grad_xhat));",
             "            vst1q_f32(&grad_x[offset + j], vmulq_f32(v_term1, v_term2));",
-            "      }", 
+            "      }",
+            f"      for (; j < {F}; ++j) {{",
+            "          float x_hat = (x[offset+j] - mean) * inv_std;",
+            "          float term = (F * grad_out[offset+j] - row_sum_grad - x_hat * row_sum_grad_xhat);",
+            "          grad_x[offset+j] = (gamma[j] * inv_std / F) * term;",
+            "      }",
             "   }",
             "}"
         ]
         return "\n".join(code)
-
+    
     def compile_fused_loss_forward(self, node: Node) -> str:
-        B, F = node.inputs[0].shape # Logits shape
+        # Check dimensionality. If 3D (B, S, E), we assume user flattened or we handle 2D.
+        # This kernel expects strictly 2D (N, C) inputs where C is classes.
+        shape = node.inputs[0].shape
+        if len(shape) == 2:
+            B, F = shape
+        else:
+            # Fallback for 3D: treat B*S as batch dimension
+            B = shape[0] * shape[1]
+            F = shape[2]
+            
         code = [
             "#include <arm_neon.h>", "#include <cmath>", "#include <omp.h>",
             "extern \"C\" void compute(float** vars, int n) {",
@@ -688,38 +721,491 @@ class Compiler:
         return "\n".join(code)
     
     def compile_fused_loss_backward(self, node: Node) -> str:
-        # We assume node.inputs[0] is Logits (B, F) and node.inputs[1] is Targets (B)
-        B, F = node.inputs[0].shape
+        shape = node.inputs[0].shape
+        if len(shape) == 2: B, F = shape
+        else: B = shape[0] * shape[1]; F = shape[2]
+        code = [
+            "#include <arm_neon.h>", "#include <cmath>", "#include <omp.h>",
+            "extern \"C\" void loss_backward(float** grads, float** inputs, int B, float* grad_out) {",
+            "    float* grad_logits = grads[0]; float* logits = inputs[0]; float* targets = inputs[1];",
+            f"    int F = {F};",
+            "    #pragma omp parallel for",
+            "    for (int i = 0; i < B; ++i) {",
+            "        int offset = i * F;",
+            "        float max_l = logits[offset];",
+            "        for (int j = 1; j < F; ++j) { if(logits[offset+j] > max_l) max_l = logits[offset+j]; }",
+            "        float sum_e = 0.0f;",
+            "        for (int j = 0; j < F; ++j) { sum_e += expf(logits[offset+j] - max_l); }",
+            "        int target_idx = (int)targets[i];",
+            "        float g_out_val = grad_out[i];",
+            "        for (int j = 0; j < F; ++j) {",
+            "            float prob = expf(logits[offset+j] - max_l) / sum_e;",
+            "            grad_logits[offset + j] = (j == target_idx) ? (prob - 1.0f) : prob;",
+            "            grad_logits[offset + j] *= g_out_val;",
+            "        }",
+            "    }",
+            "}"
+        ]
+        return "\n".join(code)
+    
+    def compile_mha_forward(self, node: Node)-> str: 
+        B, S, E = node.shape
+        num_heads = node.attributes['num_heads']
+        head_dim = E // num_heads
+        scale = 1.0 / np.sqrt(head_dim)
+        vec_limit = head_dim - (head_dim % 4)
         code = [
             "#include <arm_neon.h>",
             "#include <cmath>",
             "#include <omp.h>",
             "",
-            "extern \"C\" void loss_backward(float** grads, float** inputs, int B, float* grad_out) {",
-            "    float* grad_logits = grads[0];",
-            "    float* logits = inputs[0];",
-            "    float* targets = inputs[1];",
-            f"    int F = {F};",
+            "extern \"C\" void compute(float** vars, int n) {",
+            "    float* output = vars[0]; float* Q = vars[1]; float* K = vars[2]; float* V = vars[3];",
+            f"    const float scale_val = {scale}f;",
+            "    float32x4_t v_scale = vdupq_n_f32(scale_val);",
             "",
-            "    #pragma omp parallel for",
-            "    for (int i = 0; i < B; ++i) {",
-            "        int offset = i * F;",
-            "        // 1. Recompute Softmax for this row",
-            "        float max_l = logits[offset];",
-            "        for (int j = 1; j < F; ++j) { if(logits[offset+j] > max_l) max_l = logits[offset+j]; }",
-            "        ",
-            "        float sum_e = 0.0f;",
-            "        for (int j = 0; j < F; ++j) { sum_e += expf(logits[offset+j] - max_l); }",
+            "    #pragma omp parallel for collapse(2)",
+            f"    for (int b = 0; b < {B}; ++b) {{",
+            f"        for (int h = 0; h < {num_heads}; ++h) {{",
+            f"            for (int i = 0; i < {S}; ++i) {{",
+            f"                float scores[{S}];",
+            "                float max_score = -1e9f;",
             "",
-            "        // 2. Gradient: (prob - 1) if j == target else prob",
-            "        int target_idx = (int)targets[i];",
-            "        for (int j = 0; j < F; ++j) {",
-            "            float prob = expf(logits[offset+j] - max_l) / sum_e;",
-            "            // Multiply by grad_out[i] in case of weighted loss, though usually 1.0",
-            "            grad_logits[offset + j] = (j == target_idx) ? (prob - 1.0f) : prob;",
-            "            grad_logits[offset + j] *= grad_out[i];",
+            "                // 1. Vectorized Scaled Dot-Product (Q @ K.T)",
+            f"                for (int j = 0; j < {S}; ++j) {{",
+            "                    float32x4_t v_acc = vdupq_n_f32(0.0f);",
+            "                    int k = 0;",
+            f"                    for (; k < {vec_limit}; k += 4) {{",
+            f"                        int q_idx = (b * {S} * {E}) + (i * {E}) + (h * {head_dim}) + k;",
+            f"                        int k_idx = (b * {S} * {E}) + (j * {E}) + (h * {head_dim}) + k;",
+            "                        float32x4_t v_q = vld1q_f32(&Q[q_idx]);",
+            "                        float32x4_t v_k = vld1q_f32(&K[k_idx]);",
+            "                        v_acc = vfmaq_f32(v_acc, v_q, v_k);",
+            "                    }",
+            "                    float dot = vaddvq_f32(v_acc);",
+            "                    // Scalar cleanup for head_dim",
+            f"                    for (; k < {head_dim}; ++k) {{",
+            f"                        int q_idx = (b * {S} * {E}) + (i * {E}) + (h * {head_dim}) + k;",
+            f"                        int k_idx = (b * {S} * {E}) + (j * {E}) + (h * {head_dim}) + k;",
+            "                        dot += Q[q_idx] * K[k_idx];",
+            "                    }",
+            "                    scores[j] = dot * scale_val;",
+            "                    if (scores[j] > max_score) max_score = scores[j];",
+            "                }",
+            "",
+            "                // 2. Numerically Stable Softmax (Simplified for sequence length)",
+            "                float sum_exp = 0.0f;",
+            f"                for (int j = 0; j < {S}; ++j) {{",
+            "                    scores[j] = expf(scores[j] - max_score);",
+            "                    sum_exp += scores[j];",
+            "                }",
+            "",
+            "                // 3. Vectorized Weighted Sum (Attention @ V)",
+            f"                for (int j = 0; j < {S}; ++j) {{",
+            "                    float prob = scores[j] / sum_exp;",
+            "                    float32x4_t v_prob = vdupq_n_f32(prob);",
+            "                    int k = 0;",
+            f"                    for (; k < {vec_limit}; k += 4) {{",
+            f"                        int v_idx = (b * {S} * {E}) + (j * {E}) + (h * {head_dim}) + k;",
+            f"                        int out_idx = (b * {S} * {E}) + (i * {E}) + (h * {head_dim}) + k;",
+            "                        float32x4_t v_v = vld1q_f32(&V[v_idx]);",
+            "                        float32x4_t v_out = vld1q_f32(&output[out_idx]);",
+            "                        vst1q_f32(&output[out_idx], vfmaq_f32(v_out, v_prob, v_v));",
+            "                    }",
+            "                    // Scalar cleanup for output",
+            f"                    for (; k < {head_dim}; ++k) {{",
+            f"                        int v_idx = (b * {S} * {E}) + (j * {E}) + (h * {head_dim}) + k;",
+            f"                        int out_idx = (b * {S} * {E}) + (i * {E}) + (h * {head_dim}) + k;",
+            "                        output[out_idx] += prob * V[v_idx];",
+            "                    }",
+            "                }",
+            "            }",
             "        }",
             "    }",
+            "}"
+        ]
+
+        return "\n".join(code)
+    
+    def compile_mha_backward(self, node: Node) -> str: 
+        B, S, E = node.shape
+        num_heads = node.attributes['num_heads'] 
+        head_dim = E // num_heads
+        scale = 1 / np.sqrt(head_dim)
+        vec_limit = head_dim - (head_dim % 4)  
+
+        code = [
+            "#include <arm_neon.h>", "#include <cmath>", "#include <omp.h>",
+            "extern \"C\" void mha_backward(float** grads, float** inputs, int n, float* grad_out) {",
+            "    float* gQ = grads[0]; float* gK = grads[1]; float* gV = grads[2];",
+            "    float* Q = inputs[0];  float* K = inputs[1];  float* V = inputs[2];",
+            f"    const float scale_val = {scale}f;",
+            "",
+            "    #pragma omp parallel for collapse(2)",
+            f"    for (int b = 0; b < {B}; ++b) {{",
+            f"        for (int h = 0; h < {num_heads}; ++h) {{",
+            f"            for (int i = 0; i < {S}; ++i) {{",
+            f"                float probs[{S}]; float dS[{S}];",
+            f"                float* q_row = &Q[(b * {S} * {E}) + (i * {E}) + (h * {head_dim})];",
+            f"                float* gq_row = &gQ[(b * {S} * {E}) + (i * {E}) + (h * {head_dim})];",
+            f"                float* gout_row = &grad_out[(b * {S} * {E}) + (i * {E}) + (h * {head_dim})];",
+            "",
+            "                // 1. Recompute Probs (Simplified for speed)",
+            "                float max_s = -1e9f;",
+            f"                for (int j = 0; j < {S}; ++j) {{",
+            f"                    float* k_row = &K[(b * {S} * {E}) + (j * {E}) + (h * {head_dim})];",
+            "                    float dot = 0.0f; int k=0;",
+            "                    if (head_dim >= 4) {",
+            "                        float32x4_t v_acc = vdupq_n_f32(0.0f);",
+            f"                        for (; k < {vec_limit}; k += 4) v_acc = vfmaq_f32(v_acc, vld1q_f32(q_row+k), vld1q_f32(k_row+k));",
+            "                        dot = vaddvq_f32(v_acc);",
+            "                    }",
+            f"                    for (; k < {head_dim}; ++k) dot += q_row[k] * k_row[k];",
+            "                    probs[j] = dot * scale_val;",
+            "                    if (probs[j] > max_s) max_s = probs[j];",
+            "                }",
+            "                float sum_e = 0.0f;",
+            f"                for (int j = 0; j < {S}; ++j) {{", 
+            "                   probs[j] = expf(probs[j] - max_s); sum_e += probs[j];",
+            "                }",
+            f"                for (int j = 0; j < {S}; ++j) probs[j] /= sum_e;",
+            "",
+            "                // 2. Vectorized gV and dS",
+            f"                float row_sum_dP = 0.0f;",
+            f"                for (int j = 0; j < {S}; ++j) {{",
+            f"                    float* v_row = &V[(b * {S} * {E}) + (j * {E}) + (h * {head_dim})];",
+            f"                    float* gv_row = &gV[(b * {S} * {E}) + (j * {E}) + (h * {head_dim})];",
+            "                    float32x4_t v_p = vdupq_n_f32(probs[j]);",
+            "                    float32x4_t v_dp_acc = vdupq_n_f32(0.0f);",
+            "                    int k = 0;",
+            f"                    for (; k < {vec_limit}; k += 4) {{",
+            "                        float32x4_t v_go = vld1q_f32(gout_row + k);",
+            "                        vst1q_f32(gv_row+k, vfmaq_f32(vld1q_f32(gv_row+k), v_p, v_go));",
+            "                        v_dp_acc = vfmaq_f32(v_dp_acc, v_go, vld1q_f32(v_row+k));",
+            "                    }",
+            "                    float dp_j = vaddvq_f32(v_dp_acc);",
+            f"                    for (; k < {head_dim}; ++k) {{",  
+            "                        gv_row[k] += probs[j] * gout_row[k]; dp_j += gout_row[k] * v_row[k];", 
+            "                    }",
+            "                    dS[j] = dp_j; row_sum_dP += probs[j] * dp_j;",
+            "                }",
+            "",
+            "                // 3. Vectorized gQ and gK",
+            f"                for (int j = 0; j < {S}; ++j) {{",
+            f"                    float* k_row = &K[(b * {S} * {E}) + (j * {E}) + (h * {head_dim})];",
+            f"                    float* gk_row = &gK[(b * {S} * {E}) + (j * {E}) + (h * {head_dim})];",
+            "                    float32x4_t v_grad_s = vdupq_n_f32(scale_val * probs[j] * (dS[j] - row_sum_dP));",
+            "                    int k = 0;",
+            f"                    for (; k < {vec_limit}; k += 4) {{",
+            "                        vst1q_f32(gq_row+k, vfmaq_f32(vld1q_f32(gq_row+k), v_grad_s, vld1q_f32(k_row+k)));",
+            "                        vst1q_f32(gk_row+k, vfmaq_f32(vld1q_f32(gk_row+k), v_grad_s, vld1q_f32(q_row+k)));",
+            "                    }",
+            f"                    for (; k < {head_dim}; ++k) {{",
+            "                        float gs = vgetq_lane_f32(v_grad_s, 0);",
+            "                        gq_row[k] += gs * k_row[k]; gk_row[k] += gs * q_row[k];",
+            "                    }",
+            "                }",
+            "            }",
+            "        }",
+            "    }",
+            "}"
+        ]
+        return "\n".join(code)
+    
+    def compile_GELU_forward_SIMD(self, node: Node) -> str: 
+        total_elements = int(np.prod(node.shape))
+        vec_limit = total_elements - (total_elements % 4)
+        code = [
+            "#include <arm_neon.h>", 
+            "#include <cmath>", 
+            "#include <omp.h>", 
+            "", 
+            "extern \"C\" void compute(float** vars, int n) {",
+            "   float* output = vars[0];", 
+            "   float* input = vars[1]; ", 
+            "   const float c1 = 0.797885; // sqrt(2/pi)", 
+            "   const float a = 0.44715; // a-> optained via numeric optimization", 
+            "   float32x4_t v_c1 = vdupq_n_f32(c1);", 
+            "   float32x4_t v_a = vdupq_n_f32(a);", 
+            "   float32x4_t v_one = vdupq_n_f32(1.0f);", 
+            "   float32x4_t v_half = vdupq_n_f32(0.5f);", 
+            "   float32x4_t v_fif = vdupq_n_f32(15.0f);", 
+            "   float32x4_t v_six = vdupq_n_f32(6.0f);", 
+            "   #pragma omp parallel for",
+            f"   for(int i = 0; i < {vec_limit}; i+=4){{",
+            "       float32x4_t x = vld1q_f32(input+i);",
+            "       float32x4_t x3 = vmulq_f32(vmulq_f32(x, x), x);",
+            "       float32x4_t inner = vmulq_f32(v_c1, vfmaq_f32(x, v_a, x3));",
+            "       float32x4_t y2 = vmulq_f32(inner, inner);", 
+            "       float32x4_t y3 = vmulq_f32(inner, y2);", 
+            "       float32x4_t upper = vaddq_f32(vmulq_f32(v_fif, inner), y3);", 
+            "       float32x4_t lower = vaddq_f32(v_fif, vmulq_f32(v_six, y2));", 
+            "       float32x4_t tanh_approx = vdivq_f32(upper, lower);", 
+            "       float32x4_t gelu_approx = vmulq_f32(vmulq_f32(v_half, x), vaddq_f32(v_one, tanh_approx));",
+            "       vst1q_f32(output+i, gelu_approx);",
+            "   }", 
+            "    // Scalar cleanup",
+            f"    for (int i = {vec_limit}; i < n; ++i) {{",
+            "        float x = input[i];",
+            "        output[i] = 0.5f * x * (1.0f + tanhf(c1 * (x + a * x * x * x)));",
+            "    }",
+            "}",  
+
+        ]
+        return "\n".join(code)
+    
+    def compile_GELU_Backward_SIMD(self, node: Node) -> str:
+        total_elements = int(np.prod(node.shape))
+        vec_limit = total_elements - (total_elements % 4)
+
+        code = [
+            "#include <arm_neon.h>",
+            "#include <cmath>",
+            "#include <omp.h>",
+            "",
+            "extern \"C\" void gelu_backward(float** grads, float** inputs, int n, float* grad_out) {",
+            "    float* grad_in = grads[0];  // Gradient to propagate back",
+            "    float* input = inputs[0];   // Original forward input",
+            "    ",
+            "    const float c1 = 0.797885f; // sqrt(2/pi)",
+            "    const float a = 0.44715f;",
+            "    float32x4_t v_c1 = vdupq_n_f32(c1);",
+            "    float32x4_t v_a = vdupq_n_f32(a);",
+            "    float32x4_t v_one = vdupq_n_f32(1.0f);",
+            "    float32x4_t v_half = vdupq_n_f32(0.5f);",
+            "    float32x4_t v_fif = vdupq_n_f32(15.0f);", 
+            "    float32x4_t v_six = vdupq_n_f32(6.0f);",
+            "    ",
+            "    #pragma omp parallel for",
+            f"    for(int i = 0; i < {vec_limit}; i += 4) {{",
+            "        float32x4_t x = vld1q_f32(input + i);",
+            "        float32x4_t gout = vld1q_f32(grad_out + i);",
+            "        ",
+            "        // 1. Recompute inner term",
+            "        float32x4_t x2 = vmulq_f32(x, x);",
+            "        float32x4_t inner = vmulq_f32(v_c1, vfmaq_f32(x, v_a, vmulq_f32(x2, x)));",
+            "        ",
+            "        // 2. Padé Tanh Approximation",
+            "        float32x4_t y2 = vmulq_f32(inner, inner);",
+            "        float32x4_t y3 = vmulq_f32(inner, y2);",
+            "        float32x4_t tanh_res = vdivq_f32(vfmaq_f32(y3, v_fif, inner), vfmaq_f32(v_fif, v_six, y2));",
+            "        ",
+            "        // 3. GELU Derivative Approximation: 0.5 * (1 + tanh(y) + x * sech^2(y) * dy/dx)",
+            "        // We use a simplified stable version: 0.5 * (1 + tanh + (x * 0.797 * (1 + 3 * 0.447 * x^2)) * (1 - tanh^2))",
+            "        float32x4_t sech2 = vsubq_f32(v_one, vmulq_f32(tanh_res, tanh_res));",
+            "        float32x4_t dy_dx = vmulq_f32(v_c1, vfmaq_f32(v_one, vdupq_n_f32(3.0f * 0.44715f), x2));",
+            "        float32x4_t local_grad = vmulq_f32(v_half, vaddq_f32(vaddq_f32(v_one, tanh_res), vmulq_f32(vmulq_f32(x, dy_dx), sech2)));",
+            "        ",
+            "        // 4. Chain rule: grad_in += grad_out * local_grad",
+            "        vst1q_f32(grad_in + i, vfmaq_f32(vld1q_f32(grad_in + i), gout, local_grad));",
+            "    }",
+            "    ",
+            "    // Scalar cleanup",
+            f"    for(int i = {vec_limit}; i < n; ++i) {{",
+            "        float x = input[i];",
+            "        float inner = c1 * (x + a * x * x * x);",
+            "        float t = tanhf(inner);",
+            "        float dg = 0.5f * (1.0f + t + x * (1.0f - t * t) * (c1 * (1.0f + 3.0f * a * x * x)));",
+            "        grad_in[i] += grad_out[i] * dg;",
+            "    }",
+            "}"
+        ]
+        return "\n".join(code)
+
+    def compile_FFN_forward_SIMD(self, node: Node) -> str:
+        B, S, E = node.inputs[0].shape 
+        H = node.attributes['hidden_dim']
+        vec_limit_H = H - (H % 4)
+
+        code = [
+            "#include <arm_neon.h>", "#include <cmath>", "#include <omp.h>",
+            "extern \"C\" void compute(float** vars, int n) {", 
+            "   float* output = vars[0]; float* X = vars[1];",
+            "   float* W1 = vars[2];     float* b1 = vars[3];",
+            "   float* W2_T = vars[4];   float* b2 = vars[5];", # Named W2_T to match your loop
+            "   const float c1 = 0.797885f; const float a_const = 0.44715f;",
+            "   float32x4_t v_c1 = vdupq_n_f32(c1);", 
+            "   float32x4_t v_a = vdupq_n_f32(a_const);", 
+            "   float32x4_t v_one = vdupq_n_f32(1.0f);", 
+            "   float32x4_t v_half = vdupq_n_f32(0.5f);", 
+            "   float32x4_t v_fif = vdupq_n_f32(15.0f);", 
+            "   float32x4_t v_six = vdupq_n_f32(6.0f);", 
+            "",
+            "   #pragma omp parallel for collapse(2)", 
+            f"   for(int b = 0; b < {B}; ++b) {{",
+            f"       for(int s = 0; s < {S}; ++s) {{",
+            f"           float* x_ptr = &X[(b * {S} * {E}) + (s * {E})];",
+            f"           float* out_ptr = &output[(b * {S} * {E}) + (s * {E})];",
+            "",
+            "           // 1. Initialize output row with b2",
+            f"           for(int e = 0; e < {E}; ++e) out_ptr[e] = b2[e];",
+            "",
+            "           // 2. Vectorized Expansion + GELU + Contraction",
+            f"           for(int h = 0; h < {vec_limit_H}; h += 4) {{", 
+            "               float32x4_t v_acc = vld1q_f32(&b1[h]);", 
+            f"               for (int e = 0; e < {E}; ++e) {{",
+            "                   float32x4_t v_x = vdupq_n_f32(x_ptr[e]);",
+            f"                   float32x4_t v_w1 = vld1q_f32(&W1[e * {H} + h]);", 
+            "                   v_acc = vfmaq_f32(v_acc, v_x, v_w1);", 
+            "               }", 
+            "", 
+            "               float32x4_t x3 = vmulq_f32(vmulq_f32(v_acc, v_acc), v_acc);",
+            "               float32x4_t inner = vmulq_f32(v_c1, vfmaq_f32(v_acc, v_a, x3));",
+            "               float32x4_t y2 = vmulq_f32(inner, inner);", 
+            "               float32x4_t y3 = vmulq_f32(inner, y2);", 
+            "               float32x4_t tanh_approx = vdivq_f32(vfmaq_f32(y3, v_fif, inner), vfmaq_f32(v_fif, v_six, y2));", 
+            "               float32x4_t v_gelu = vmulq_f32(vmulq_f32(v_half, v_acc), vaddq_f32(v_one, tanh_approx));",
+            "",
+            f"               for (int e = 0; e < {E}; ++e) {{",
+            f"                   float32x4_t v_w2 = vld1q_f32(&W2_T[e * {H} + h]);", 
+            "                   out_ptr[e] += vaddvq_f32(vmulq_f32(v_gelu, v_w2));", 
+            "               }", 
+            "           }", 
+            "",
+            "           // 3. Scalar tail for hidden_dim (Now inside the token loop!)",
+            f"           for(int h = {vec_limit_H}; h < {H}; ++h) {{",
+            "               float val_h = b1[h];", 
+            f"              for(int e = 0; e < {E}; ++e) val_h += x_ptr[e] * W1[e * {H} + h];",
+            "               float t_inner = c1 * (val_h + a_const * val_h * val_h * val_h);",
+            "               float gelu_h = 0.5f * val_h * (1.0f + tanhf(t_inner));",
+            f"              for(int e = 0; e < {E}; ++e) out_ptr[e] += gelu_h * W2_T[e * {H} + h];",
+            "           }",
+            "       }",
+            "   }",
+            "}"
+        ]
+        return "\n".join(code)
+    
+    def compile_FFN_backward_SIMD(self, node: Node) -> str: 
+        B, S, E = node.inputs[0].shape
+        H = node.attributes['hidden_dim']
+        vec_limit_H = H - (H % 4)
+        
+        # FIX: Use VLA (Stack) instead of std::vector (Heap) to prevent OpenMP heap corruption
+        code = [
+            "#include <arm_neon.h>", "#include <omp.h>", "#include <cmath>", 
+            "extern \"C\" void compute_backward(float** grads, float** inputs, int n, float* grad_out) {", 
+            "   float* gX = grads[0];   float* gW1 = grads[1];  float* gb1 = grads[2];", 
+            "   float* gW2 = grads[3];  float* gb2 = grads[4];", 
+            "   float* X = inputs[0];    float* W1 = inputs[1];   float* b1 = inputs[2];", 
+            "   float* W2_T = inputs[3]; float* b2 = inputs[4];", 
+            "   const float c1 = 0.797885f; const float a_const = 0.44715f;",
+            "   float32x4_t v_c1 = vdupq_n_f32(c1); float32x4_t v_a = vdupq_n_f32(a_const);", 
+            "   float32x4_t v_one = vdupq_n_f32(1.0f); float32x4_t v_half = vdupq_n_f32(0.5f);", 
+            "   float32x4_t v_fif = vdupq_n_f32(15.0f); float32x4_t v_six = vdupq_n_f32(6.0f);", 
+            "   #pragma omp parallel for collapse(2)", 
+            f"   for(int b=0; b < {B}; b++) {{", 
+            f"       for(int s = 0; s < {S}; ++s) {{", 
+            f"           float* x_ptr = &X[(b * {S} * {E}) + (s * {E})];",
+            f"           float* gout_ptr = &grad_out[(b * {S} * {E}) + (s * {E})];",
+            f"           float hidden[{H}]; float gelu_act[{H}];",
+            f"           float tanh_save[{H}]; float dL_dh_save[{H}];",
+            "",
+            "           // 1. Recompute Hidden & GELU",
+            f"           for(int h=0; h < {vec_limit_H}; h+=4) {{", 
+            "               float32x4_t v_h = vld1q_f32(&b1[h]);", 
+            f"               for(int e = 0; e < {E}; ++e) {{", 
+            f"                   v_h = vfmaq_f32(v_h, vdupq_n_f32(x_ptr[e]), vld1q_f32(&W1[e * {H} + h]));", 
+            "               }", 
+            "               vst1q_f32(&hidden[h], v_h);",
+            "               float32x4_t x3 = vmulq_f32(v_h, vmulq_f32(v_h, v_h));", 
+            "               float32x4_t inner = vmulq_f32(v_c1, vfmaq_f32(v_h, v_a, x3));", 
+            "               float32x4_t y2 = vmulq_f32(inner, inner);", 
+            "               float32x4_t t = vdivq_f32(vfmaq_f32(vmulq_f32(inner, y2), v_fif, inner), vfmaq_f32(v_fif, v_six, y2));", 
+            "               vst1q_f32(&tanh_save[h], t);",
+            "               vst1q_f32(&gelu_act[h], vmulq_f32(vmulq_f32(v_half, v_h), vaddq_f32(v_one, t)));", 
+            "           }", 
+            f"           for(int h={vec_limit_H}; h < {H}; h++) {{",
+            "               float val = b1[h];",
+            f"               for(int e=0; e < {E}; e++) val += x_ptr[e] * W1[e * {H} + h];",
+            "               hidden[h] = val; float t = tanhf(c1 * (val + a_const * val * val * val));",
+            "               tanh_save[h] = t; gelu_act[h] = 0.5f * val * (1.0f + t);",
+            "           }",
+            "",
+            "           // 2. Gradients for W2 and b2",
+            f"           for (int e=0; e < {E}; e++) {{", 
+            "               float go = gout_ptr[e];",
+            "               #pragma omp atomic", 
+            "               gb2[e] += go;",
+            "               float32x4_t v_go = vdupq_n_f32(go);", 
+            f"               for(int h = 0; h < {vec_limit_H}; h+=4) {{",
+            "                   float32x4_t v_act = vld1q_f32(&gelu_act[h]);", 
+            "                   float32x4_t v_gw2 = vmulq_f32(v_act, v_go);", 
+            "                   #pragma omp atomic",
+            f"                   gW2[(h+0) * {E} + e] += vgetq_lane_f32(v_gw2, 0);",
+            "                   #pragma omp atomic",
+            f"                   gW2[(h+1) * {E} + e] += vgetq_lane_f32(v_gw2, 1);",
+            "                   #pragma omp atomic",
+            f"                   gW2[(h+2) * {E} + e] += vgetq_lane_f32(v_gw2, 2);",
+            "                   #pragma omp atomic",
+            f"                   gW2[(h+3) * {E} + e] += vgetq_lane_f32(v_gw2, 3);", 
+            "               }", 
+            f"               for(int h={vec_limit_H}; h < {H}; ++h) {{",
+            "                   #pragma omp atomic",
+            f"                  gW2[h * {E} + e] += gelu_act[h] * go;",
+            "               }",
+            "           }",
+            "           // 3. GELU Backprop & W1/b1 Gradients",
+            f"           for(int h = 0; h < {vec_limit_H}; h+=4) {{", 
+            "               float32x4_t v_dL_dgelu = vdupq_n_f32(0.0f);", 
+            f"               for (int e = 0; e < {E}; ++e) {{", 
+            f"                   v_dL_dgelu = vfmaq_f32(v_dL_dgelu, vdupq_n_f32(gout_ptr[e]), vld1q_f32(&W2_T[e * {H} + h]));", 
+            "               }", 
+            "               float32x4_t v_h = vld1q_f32(&hidden[h]); float32x4_t v_t = vld1q_f32(&tanh_save[h]);",
+            "               float32x4_t v_dy = vmulq_f32(v_c1, vfmaq_f32(v_one, vdupq_n_f32(3.0f * 0.44715f), vmulq_f32(v_h, v_h)));",
+            "               float32x4_t v_dg = vmulq_f32(v_half, vaddq_f32(vaddq_f32(v_one, v_t), vmulq_f32(vmulq_f32(v_h, vsubq_f32(v_one, vmulq_f32(v_t, v_t))), v_dy)));",
+            "               float32x4_t v_dL_dh = vmulq_f32(v_dL_dgelu, v_dg);",
+            "               #pragma omp atomic",
+            "               gb1[h+0] += vgetq_lane_f32(v_dL_dh, 0);",
+            "               #pragma omp atomic",
+            "               gb1[h+1] += vgetq_lane_f32(v_dL_dh, 1);",
+            "               #pragma omp atomic",
+            "               gb1[h+2] += vgetq_lane_f32(v_dL_dh, 2);",
+            "               #pragma omp atomic",
+            "               gb1[h+3] += vgetq_lane_f32(v_dL_dh, 3);",
+            "               vst1q_f32(&dL_dh_save[h], v_dL_dh);",
+            f"               for(int e=0; e < {E}; ++e) {{",
+            "                   float32x4_t v_gw1 = vmulq_f32(vdupq_n_f32(x_ptr[e]), v_dL_dh);",
+            "                   #pragma omp atomic",
+            f"                   gW1[e * {H} + h + 0] += vgetq_lane_f32(v_gw1, 0);",
+            "                   #pragma omp atomic",
+            f"                   gW1[e * {H} + h + 1] += vgetq_lane_f32(v_gw1, 1);",
+            "                   #pragma omp atomic",
+            f"                   gW1[e * {H} + h + 2] += vgetq_lane_f32(v_gw1, 2);",
+            "                   #pragma omp atomic",
+            f"                   gW1[e * {H} + h + 3] += vgetq_lane_f32(v_gw1, 3);",
+            "               }",
+            "           }",
+            f"           for(int h={vec_limit_H}; h < {H}; ++h) {{",
+            "               float dL_dg = 0.0f;", 
+            f"              for(int e=0; e<{E}; ++e) dL_dg += gout_ptr[e] * W2_T[e * {H} + h];",
+            "               float t = tanh_save[h]; float x = hidden[h];",
+            "               float dg = 0.5f * (1.0f + t + x * (1.0f - t * t) * (c1 * (1.0f + 3.0f * a_const * x * x)));",
+            "               float dL_dh = dL_dg * dg;", 
+            "               #pragma omp atomic", 
+            "               gb1[h] += dL_dh;",
+            "               dL_dh_save[h] = dL_dh;",
+            f"               for(int e=0; e < {E}; ++e) {{",
+            "                   #pragma omp atomic",
+            f"                  gW1[e * {H} + h] += x_ptr[e] * dL_dh;", 
+            "               }",
+            "           }",
+            "           // 4. Gradient for Input X",
+            f"           float* gx_ptr = &gX[(b * {S} * {E}) + (s * {E})];",
+            f"           for(int e = 0; e < {E}; ++e) {{",
+            "               float32x4_t v_acc = vdupq_n_f32(0.0f);",
+            "               int h = 0;",
+            f"               for(; h < {vec_limit_H}; h += 4) {{",
+            "                   float32x4_t v_dh = vld1q_f32(&dL_dh_save[h]);",
+            f"                   float32x4_t v_w1 = vld1q_f32(&W1[e * {H} + h]);",
+            "                   v_acc = vfmaq_f32(v_acc, v_dh, v_w1);",
+            "               }",
+            "               float acc = vaddvq_f32(v_acc);",
+            f"              for(; h < {H}; ++h) acc += dL_dh_save[h] * W1[e * {H} + h];",
+            "               gx_ptr[e] += acc;", 
+            "           }",
+            "       }",  
+            "   }", 
             "}"
         ]
         return "\n".join(code)
@@ -742,6 +1228,12 @@ class Compiler:
             cpp_code = self.compile_LayerNorm_SIMD(root_node)
         elif root_node.op_type == Operators.SOFTMAX_CROSS_ENTROPY:
             cpp_code = self.compile_fused_loss_forward(root_node)
+        elif root_node.op_type == Operators.MHA:
+            cpp_code = self.compile_mha_forward(root_node)
+        elif root_node.op_type == Operators.GELU:
+            cpp_code = self.compile_GELU_forward_SIMD(root_node)
+        elif root_node.op_type == Operators.FFN:
+            cpp_code = self.compile_FFN_forward_SIMD(root_node)
         else:
             cpp_code = self.compile(root_node)
         
@@ -817,6 +1309,15 @@ class Compiler:
         elif root_node.op_type == Operators.SOFTMAX_CROSS_ENTROPY:
             cpp_code = self.compile_fused_loss_backward(root_node)
             func_name = "loss_backward"
+        elif root_node.op_type == Operators.MHA:
+            cpp_code = self.compile_mha_backward(root_node)
+            func_name = "mha_backward"
+        elif root_node.op_type == Operators.GELU: 
+            cpp_code = self.compile_GELU_Backward_SIMD(root_node)
+            func_name = "gelu_backward"
+        elif root_node.op_type == Operators.FFN:
+            cpp_code = self.compile_FFN_backward_SIMD(root_node)
+            func_name = "compute_backward"
         else:
             cpp_code = self.compile_backward(root_node)
             func_name = "compute_backward"

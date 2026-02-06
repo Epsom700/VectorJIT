@@ -28,7 +28,7 @@ for epoch in range(100):
     Y = Tensor(name="Y", shape=(4,), data=Y_data)
     
     # Build graph
-    hidden = (X @ W1).relu()
+    hidden = (X @ W1).gelu()
     logits = hidden @ W2
     loss_tensor = logits.softmax_cross_entropy(Y)
     
@@ -38,8 +38,10 @@ for epoch in range(100):
     
     # Backward
     optimizer.zero_grad()
+
+
     loss_tensor.backward()
-    
+    optimizer.clip_gradients(max_norm=1.0)
     # Update
     optimizer.step()
     

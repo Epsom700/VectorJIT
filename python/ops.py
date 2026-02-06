@@ -42,6 +42,10 @@ class Operators(Enum):
     NORMALIZE = 37
     LSTM = 38
     GRU = 39
+    MHA = 40
+    GELU = 41
+    FFN = 42
+    CUSTOM = 99
 class Node: 
     def __init__(self, op_type: Operators, inputs: Optional[List['Node']] = None, attributes: Optional[dict] = None, name: Optional[str]= None, shape: Tuple[int, ...]=None, requires_grad: bool = False, backward_func=None, saved_tensors: List=None) -> None:
         self.op_type = op_type
