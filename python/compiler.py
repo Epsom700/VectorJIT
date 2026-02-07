@@ -1271,20 +1271,20 @@ class Compiler:
         compile_cmd += [src_path, "-o", lib_path]
         
         # macOS Detection for OpenMP
-        import platform
-        if platform.system() == "Darwin":
-            # Apple Clang needs special flags for OpenMP
-            compile_cmd += ["-Xpreprocessor", "-fopenmp"]
-            compile_cmd += ["-lomp"]
+        # import platform
+        # if platform.system() == "Darwin":
+        #     # Apple Clang needs special flags for OpenMP
+        #     compile_cmd += ["-Xpreprocessor", "-fopenmp"]
+        #     compile_cmd += ["-lomp"]
             
-            # Add Homebrew paths for libomp (Critical for Apple Silicon)
-            compile_cmd += ["-I/opt/homebrew/opt/libomp/include"]
-            compile_cmd += ["-L/opt/homebrew/opt/libomp/lib"]
-        else:
-            # Linux/Windows (GCC)
-            compile_cmd += ["-fopenmp"]
+        #     # Add Homebrew paths for libomp (Critical for Apple Silicon)
+        #     compile_cmd += ["-I/opt/homebrew/opt/libomp/include"]
+        #     compile_cmd += ["-L/opt/homebrew/opt/libomp/lib"]
+        # else:
+        #     # Linux/Windows (GCC)
+        #     compile_cmd += ["-fopenmp"]
             
-        compile_cmd += [src_path, "-o", lib_path]
+        # compile_cmd += [src_path, "-o", lib_path]
         
         # 4. Run Compiler & Capture Output
         result = subprocess.run(compile_cmd, capture_output=True, text=True)
@@ -1365,20 +1365,20 @@ class Compiler:
         compile_cmd += [src_path, "-o", lib_path]
         
         # # macOS Detection for OpenMP
-        import platform
-        if platform.system() == "Darwin":
-            # Apple Clang needs special flags for OpenMP
-            compile_cmd += ["-Xpreprocessor", "-fopenmp"]
-            compile_cmd += ["-lomp"]
+        # import platform
+        # if platform.system() == "Darwin":
+        #     # Apple Clang needs special flags for OpenMP
+        #     compile_cmd += ["-Xpreprocessor", "-fopenmp"]
+        #     compile_cmd += ["-lomp"]
             
-            # Add Homebrew paths for libomp (Critical for Apple Silicon)
-            compile_cmd += ["-I/opt/homebrew/opt/libomp/include"]
-            compile_cmd += ["-L/opt/homebrew/opt/libomp/lib"]
-        else:
-            # Linux/Windows (GCC)
-            compile_cmd += ["-fopenmp"]
+        #     # Add Homebrew paths for libomp (Critical for Apple Silicon)
+        #     compile_cmd += ["-I/opt/homebrew/opt/libomp/include"]
+        #     compile_cmd += ["-L/opt/homebrew/opt/libomp/lib"]
+        # else:
+        #     # Linux/Windows (GCC)
+        #     compile_cmd += ["-fopenmp"]
             
-        compile_cmd += [src_path, "-o", lib_path]
+        # compile_cmd += [src_path, "-o", lib_path]
         
         # 4. Run Compiler & Capture Output
         result = subprocess.run(compile_cmd, capture_output=True, text=True)
