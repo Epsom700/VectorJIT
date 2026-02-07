@@ -184,11 +184,43 @@ class Tensor:
                  g_p, _k1 = self._prepare_ptr_array([node.inputs[0].grad, node.inputs[1].grad])
                  v_p, _k2 = self._prepare_ptr_array([node.inputs[0].data, node.inputs[1].data])
                  func(g_p, v_p, node.shape[0], node.grad.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
+            
+
             elif node.op_type == Operators.MHA:
-                 g_p, _k1 = self._prepare_ptr_array([node.inputs[0].grad, node.inputs[1].grad, node.inputs[2].grad])
-                 v_p, _k2 = self._prepare_ptr_array([node.inputs[0].data, node.inputs[1].data, node.inputs[2].data])
-                 grad_out_ptr = node.grad.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-                 func(g_p, v_p, node.shape[0], grad_out_ptr)
+                # CRITICAL FIX: Handle self-attention where Q=K=V=same node.
+                # If inputs share the same node, the kernel writes gQ, gK, gV
+                # to the same pointer → data race under OpenMP.
+                # Solution: allocate separate temp gradient buffers, then sum.
+                
+                q_node, k_node, v_node = node.inputs[0], node.inputs[1], node.inputs[2]
+                
+                # Check if any inputs are aliased (self-attention)
+                ids = [q_node.id, k_node.id, v_node.id]
+                has_aliasing = len(set(ids)) < 3
+                
+                if has_aliasing:
+                    # Allocate separate gradient buffers
+                    gQ_tmp = np.zeros(q_node.shape, dtype=np.float32)
+                    gK_tmp = np.zeros(k_node.shape, dtype=np.float32)
+                    gV_tmp = np.zeros(v_node.shape, dtype=np.float32)
+                    
+                    g_p, _k1 = self._prepare_ptr_array([gQ_tmp, gK_tmp, gV_tmp])
+                    v_p, _k2 = self._prepare_ptr_array([q_node.data, k_node.data, v_node.data])
+                    grad_out_ptr = node.grad.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+                    func(g_p, v_p, node.shape[0], grad_out_ptr)
+                    
+                    # Now accumulate into the actual gradient buffers (no race)
+                    q_node.grad += gQ_tmp
+                    k_node.grad += gK_tmp
+                    v_node.grad += gV_tmp
+                else:
+                    # No aliasing — direct dispatch is safe
+                    g_p, _k1 = self._prepare_ptr_array([q_node.grad, k_node.grad, v_node.grad])
+                    v_p, _k2 = self._prepare_ptr_array([q_node.data, k_node.data, v_node.data])
+                    grad_out_ptr = node.grad.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+                    func(g_p, v_p, node.shape[0], grad_out_ptr)
+
+
             elif node.op_type == Operators.LAYERNORM:
                 x_inp, gamma_inp, beta_inp = node.inputs[0], node.inputs[1], node.inputs[2]
                 if len(node.shape) == 2:
@@ -228,6 +260,7 @@ class Tensor:
         new_node = Node(Operators.ADD, inputs=[self.node, other.node], shape=self.shape, requires_grad=needs_grad)
 
         if new_node.requires_grad: 
+            # ADD backward is trivial — keep in Python (avoids JIT overhead)
             def backward_fn(grad_output, saved_tensor):
                 if self.node.requires_grad:
                     if self.node.grad is None:
@@ -266,7 +299,6 @@ class Tensor:
             raise ValueError(f"Shape Mismatch: {self.shape} vs. {other.shape}")
         needs_grad = self.requires_grad or other.requires_grad
         new_node = Node(Operators.MUL, inputs=[self.node, other.node], shape=self.shape, requires_grad=needs_grad)
-        # Backward_Pass function: 
         if new_node.requires_grad: 
             new_node.saved_tensors = [self, other]
             def backward_fn(grad_output, saved_tensors):
@@ -301,7 +333,6 @@ class Tensor:
                 if b.node.requires_grad:
                     if b.node.grad is None:
                         b.node.grad = np.zeros(b.node.shape, dtype=np.float32)
-                    # grad_b = -grad_out * a / b^2
                     b.node.grad -= grad_output * a.data / (b.data ** 2)
             new_node.backward_fn = backward_fn
         return Tensor(node=new_node)
@@ -316,22 +347,8 @@ class Tensor:
         result_shape = (self.shape[0], other.shape[1])
         new_node = Node(Operators.MATMUL, inputs=[self.node, other.node], shape=result_shape, requires_grad=needs_grad)
 
-        if needs_grad:  
-            new_node.saved_tensors = [self, other]
-
-            def backward_fn(grad_output, saved_tensors): 
-                a, b = saved_tensors
-                if a.node.requires_grad:
-                    if a.node.grad is None:
-                        a.node.grad = np.zeros(a.node.shape, dtype=np.float32)
-                    # grad_a = grad_out @ b.T
-                    a.node.grad += np.matmul(grad_output, b.data.T)
-                if b.node.requires_grad:
-                    if b.node.grad is None:
-                        b.node.grad = np.zeros(b.node.shape, dtype=np.float32)
-                    # grad_b = a.T @ grad_out
-                    b.node.grad += np.matmul(a.data.T, grad_output)
-            new_node.backward_fn = backward_fn
+        # FIX: backward_fn = None → falls through to JIT matmul backward
+        # (The old Python np.matmul backward also worked, but JIT is faster)
 
         return Tensor(node=new_node)
     
@@ -341,23 +358,13 @@ class Tensor:
         
         new_shape = (self.shape[1], self.shape[0])
         new_node = Node(Operators.TRANSPOSE, inputs=[self.node], shape=new_shape, requires_grad=self.requires_grad)
-        
-        if new_node.requires_grad:
-            def backward_fn(grad_output, saved_tensors):
-                pass
-
-            new_node.backward_fn = backward_fn
+        # backward_fn stays None — handled in backward() or not needed
         return Tensor(node=new_node)
     
     def relu(self) -> 'Tensor':
         new_shape = self.shape
         new_node = Node(Operators.RELU, inputs=[self.node], shape=new_shape, requires_grad=self.requires_grad)
-
-        if new_node.requires_grad:
-            def backward_fn(grad_output, saved_tensors):
-                pass
-
-            new_node.backward_fn = backward_fn
+        # backward_fn = None → JIT backward handles ReLU
         return Tensor(node=new_node)
     
     def layernorm(self, weight: Optional['Tensor'] = None, bias: Optional['Tensor'] = None, eps: float = 1e-5) -> 'Tensor':
@@ -367,55 +374,39 @@ class Tensor:
             shape=self.shape,
             requires_grad=True)
         
-        if new_node.requires_grad:
-            
-            def backward_fn(grad_output, saved_tensors):
-                pass
-
-            new_node.backward_fn = backward_fn
+        # FIX: backward_fn = None → JIT compile_LayerNorm_Backend_SIMD handles this
+        # Old code had `def backward_fn(...): pass` which silently ate all gradients
+        
         return Tensor(node=new_node)
     
 
     def softmax_cross_entropy(self, labels: 'Tensor') -> 'Tensor':
         new_node = Node(Operators.SOFTMAX_CROSS_ENTROPY, inputs=[self.node, labels.node], shape=(self.shape[0],), requires_grad=True)
         
-        if new_node.requires_grad:
-            def backward_fn(grad_output, saved_tensors):
-                pass
-
-            new_node.backward_fn = backward_fn
+        # FIX: backward_fn = None → JIT compile_fused_loss_backward handles this
+        # This is where the gradient chain STARTS — if this is `pass`, nothing trains
+        
         return Tensor(node=new_node)
 
     def mha(self, num_heads: int, key: 'Tensor', value: 'Tensor') -> 'Tensor':
-        # Output shape is same as query shape (B, S, E)
         new_node = Node(Operators.MHA, 
                         inputs=[self.node, key.node, value.node], 
                         attributes={'num_heads': num_heads},
                         shape=self.shape)
         if self.requires_grad or key.requires_grad or value.requires_grad:
             new_node.requires_grad = True
-            
-            def backward_fn(grad_output, saved_tensors):
-                    pass
-
-            new_node.backward_fn = backward_fn
+        
+        # FIX: backward_fn = None → JIT compile_mha_backward handles this
         
         return Tensor(node=new_node)
     
     def gelu(self) -> 'Tensor': 
         new_shape = self.shape
         new_node = Node(Operators.GELU, inputs=[self.node], shape=new_shape, requires_grad=self.requires_grad)
-
-        if new_node.requires_grad:
-            new_node.saved_tensors = [self]
-            def backward_fn(grad_output, saved_tensors):
-                pass
-
-            new_node.backward_fn = backward_fn
+        # FIX: backward_fn = None → JIT compile_GELU_Backward_SIMD handles this
         return Tensor(node=new_node)
     
     def ffn(self, W1: 'Tensor', b1: 'Tensor', W2: 'Tensor', b2: 'Tensor', hidden_dim: int) -> 'Tensor': 
-        # The FFN Super-Kernel needs all 5 tensors to compute in one pass
         new_node = Node(
             Operators.FFN, 
             inputs=[self.node, W1.node, b1.node, W2.node, b2.node], 
@@ -424,16 +415,13 @@ class Tensor:
             requires_grad=self.requires_grad or W1.requires_grad or W2.requires_grad
         )
         
-        if new_node.requires_grad:
-            # We'll implement the fused C++ backward dispatcher here next
-            def backward_fn(grad_output, saved_tensors):
-                pass
-            new_node.backward_fn = backward_fn
+        # FIX: backward_fn = None → JIT compile_FFN_backward_SIMD handles this
         
         return Tensor(node=new_node)
 
     def reshape(self, new_shape: List[int]) -> 'Tensor':
         new_node = Node(Operators.RESHAPE, inputs=[self.node], shape=tuple(new_shape), requires_grad=self.requires_grad)
+        # backward_fn = None → handled by explicit RESHAPE check in backward()
         return Tensor(node=new_node)
     
     def flatten(self) -> 'Tensor':

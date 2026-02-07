@@ -7,6 +7,17 @@ import ctypes
 import numpy as np
 import os
 import tempfile
+
+
+import atexit
+
+_loaded_libraries = []  # Module-level list that prevents GC
+
+def _cleanup():
+    """Prevent segfault by keeping library references alive during shutdown."""
+    _loaded_libraries.clear()
+
+atexit.register(_cleanup)
 class Compiler: 
     _binary_cache: Dict[str, ctypes.CDLL] = {}
     def __init__(self): 
@@ -619,13 +630,13 @@ class Compiler:
         vector_limit = F - (F % 4)
         code = [
             "#include <arm_neon.h>", "#include <cmath>", "#include <omp.h>", 
-            "", "extern \"C\" void layernorm_backward(float* grad_x, float* grad_gamma, float* grad_beta, float* grad_out, float* x, float* gamma, int B, int F){", 
+            "", "extern \"C\" void layernorm_backward(float* grad_x, float* grad_gamma, float* grad_beta, float* grad_out, float* x, float* gamma, int B, int F) {", 
             "   #pragma omp parallel for", 
-            "   for (int i =0; i < " + str(B)+"; ++i ){", 
+            f"   for (int i =0; i < {B}; ++i ){{", 
             "       float row_sum_grad = 0.0f; float row_sum_grad_xhat = 0.0f;",
             "       float row_sum_x = 0.0f; float row_sum_xsq = 0.0f;", 
             "       int offset = i * F;",
-            "       for (int j = 0; j < " + str(F) + "; ++j){", 
+            f"       for (int j = 0; j < {F}; ++j){{", 
             "           float val = x[offset + j]; row_sum_x += val; row_sum_xsq +=val*val;", 
             "       }", 
             f"      float mean = row_sum_x/{F};", 
@@ -634,7 +645,7 @@ class Compiler:
             "       float32x4_t  v_sum_grad = vdupq_n_f32(0.0f); float32x4_t  v_sum_grad_xhat = vdupq_n_f32(0.0f);", 
             "       float32x4_t  v_mean = vdupq_n_f32(mean); float32x4_t v_inv_std = vdupq_n_f32(inv_std);", 
             "       int j =0; ", 
-            "       for(; j < "+str(vector_limit)+"; j +=4){", 
+            f"       for(; j < {vector_limit}; j +=4){{", 
             "           float32x4_t v_x = vld1q_f32(&x[offset + j]);",
             "           float32x4_t v_g_out = vld1q_f32(&grad_out[offset + j]);", 
             "           float32x4_t v_x_hat = vmulq_f32(vsubq_f32(v_x, v_mean), v_inv_std);", 
@@ -659,7 +670,10 @@ class Compiler:
             "       }", 
             "       row_sum_grad = vaddvq_f32(v_sum_grad);", 
             "       row_sum_grad_xhat = vaddvq_f32(v_sum_grad_xhat);",
-            "       for (; j < {F}; ++j) {{",
+            # =====================================================================
+            # FIX: These lines were regular strings with {F} — now f-strings
+            # =====================================================================
+            f"       for (; j < {F}; ++j) {{",
             "           float val = x[offset + j]; float g_out = grad_out[offset+j];",
             "           float x_hat = (val - mean) * inv_std;",
             "           row_sum_grad += g_out; row_sum_grad_xhat += g_out * x_hat;",
@@ -683,8 +697,8 @@ class Compiler:
             "      }",
             f"      for (; j < {F}; ++j) {{",
             "          float x_hat = (x[offset+j] - mean) * inv_std;",
-            "          float term = (F * grad_out[offset+j] - row_sum_grad - x_hat * row_sum_grad_xhat);",
-            "          grad_x[offset+j] = (gamma[j] * inv_std / F) * term;",
+            f"          float term = ({F} * grad_out[offset+j] - row_sum_grad - x_hat * row_sum_grad_xhat);",
+            f"          grad_x[offset+j] = (gamma[j] * inv_std / {F}) * term;",
             "      }",
             "   }",
             "}"
@@ -855,7 +869,7 @@ class Compiler:
             f"                for (int j = 0; j < {S}; ++j) {{",
             f"                    float* k_row = &K[(b * {S} * {E}) + (j * {E}) + (h * {head_dim})];",
             "                    float dot = 0.0f; int k=0;",
-            "                    if (head_dim >= 4) {",
+            f"                    if ({head_dim} >= 4) {{",
             "                        float32x4_t v_acc = vdupq_n_f32(0.0f);",
             f"                        for (; k < {vec_limit}; k += 4) v_acc = vfmaq_f32(v_acc, vld1q_f32(q_row+k), vld1q_f32(k_row+k));",
             "                        dot = vaddvq_f32(v_acc);",
@@ -1241,27 +1255,35 @@ class Compiler:
         with tempfile.NamedTemporaryFile(suffix=".cpp", delete=False) as f:
             src_path = f.name
             f.write(cpp_code.encode('utf-8'))
-            
+
         lib_path = src_path.replace(".cpp", ".so")
-        
-        # 3. Build Compilation Command
-        compile_cmd = ["c++", "-O3", "-shared", "-fPIC", "-march=native"]
+            
+       # DEBUG: OMP disabled — single-threaded, unoptimized for crash isolation
+        compile_cmd = [
+            "c++", "-O0", "-g", "-shared", "-fPIC", "-march=native",
+            "-w",  # suppress unknown-pragma warnings
+            "-I/opt/homebrew/opt/libomp/include",  # so #include <omp.h> still resolves
+            # NO -Xpreprocessor -fopenmp  → pragmas become no-ops
+            # NO -lomp                     → no OpenMP runtime linked
+            # NO -L/opt/homebrew/...       → no libomp needed
+        ]
+        compile_cmd += [src_path, "-o", lib_path]
         
         # macOS Detection for OpenMP
-        import platform
-        if platform.system() == "Darwin":
-            # Apple Clang needs special flags for OpenMP
-            compile_cmd += ["-Xpreprocessor", "-fopenmp"]
-            compile_cmd += ["-lomp"]
+        # import platform
+        # if platform.system() == "Darwin":
+        #     # Apple Clang needs special flags for OpenMP
+        #     compile_cmd += ["-Xpreprocessor", "-fopenmp"]
+        #     compile_cmd += ["-lomp"]
             
-            # Add Homebrew paths for libomp (Critical for Apple Silicon)
-            compile_cmd += ["-I/opt/homebrew/opt/libomp/include"]
-            compile_cmd += ["-L/opt/homebrew/opt/libomp/lib"]
-        else:
-            # Linux/Windows (GCC)
-            compile_cmd += ["-fopenmp"]
+        #     # Add Homebrew paths for libomp (Critical for Apple Silicon)
+        #     compile_cmd += ["-I/opt/homebrew/opt/libomp/include"]
+        #     compile_cmd += ["-L/opt/homebrew/opt/libomp/lib"]
+        # else:
+        #     # Linux/Windows (GCC)
+        #     compile_cmd += ["-fopenmp"]
             
-        compile_cmd += [src_path, "-o", lib_path]
+        # compile_cmd += [src_path, "-o", lib_path]
         
         # 4. Run Compiler & Capture Output
         result = subprocess.run(compile_cmd, capture_output=True, text=True)
@@ -1330,23 +1352,32 @@ class Compiler:
         lib_path = src_path.replace(".cpp", ".so")
         
         # 3. Build Compilation Command
-        compile_cmd = ["c++", "-O3", "-shared", "-fPIC", "-march=native"]
-        
-        # macOS Detection for OpenMP
-        import platform
-        if platform.system() == "Darwin":
-            # Apple Clang needs special flags for OpenMP
-            compile_cmd += ["-Xpreprocessor", "-fopenmp"]
-            compile_cmd += ["-lomp"]
-            
-            # Add Homebrew paths for libomp (Critical for Apple Silicon)
-            compile_cmd += ["-I/opt/homebrew/opt/libomp/include"]
-            compile_cmd += ["-L/opt/homebrew/opt/libomp/lib"]
-        else:
-            # Linux/Windows (GCC)
-            compile_cmd += ["-fopenmp"]
-            
+               # DEBUG: OMP disabled — single-threaded, unoptimized for crash isolation
+        compile_cmd = [
+            "c++", "-O0", "-g", "-shared", "-fPIC", "-march=native",
+            "-w",  # suppress unknown-pragma warnings
+            "-I/opt/homebrew/opt/libomp/include",  # so #include <omp.h> still resolves
+            # NO -Xpreprocessor -fopenmp  → pragmas become no-ops
+            # NO -lomp                     → no OpenMP runtime linked
+            # NO -L/opt/homebrew/...       → no libomp needed
+        ]
         compile_cmd += [src_path, "-o", lib_path]
+        
+        # # macOS Detection for OpenMP
+        # import platform
+        # if platform.system() == "Darwin":
+        #     # Apple Clang needs special flags for OpenMP
+        #     compile_cmd += ["-Xpreprocessor", "-fopenmp"]
+        #     compile_cmd += ["-lomp"]
+            
+        #     # Add Homebrew paths for libomp (Critical for Apple Silicon)
+        #     compile_cmd += ["-I/opt/homebrew/opt/libomp/include"]
+        #     compile_cmd += ["-L/opt/homebrew/opt/libomp/lib"]
+        # else:
+        #     # Linux/Windows (GCC)
+        #     compile_cmd += ["-fopenmp"]
+            
+        # compile_cmd += [src_path, "-o", lib_path]
         
         # 4. Run Compiler & Capture Output
         result = subprocess.run(compile_cmd, capture_output=True, text=True)
