@@ -743,6 +743,7 @@ class Compiler:
             "extern \"C\" void loss_backward(float** grads, float** inputs, int B, float* grad_out) {",
             "    float* grad_logits = grads[0]; float* logits = inputs[0]; float* targets = inputs[1];",
             f"    int F = {F};",
+            "   float inv_B = 1.0f / B;",  # Normalize gradients by batch size
             "    #pragma omp parallel for",
             "    for (int i = 0; i < B; ++i) {",
             "        int offset = i * F;",
@@ -751,7 +752,7 @@ class Compiler:
             "        float sum_e = 0.0f;",
             "        for (int j = 0; j < F; ++j) { sum_e += expf(logits[offset+j] - max_l); }",
             "        int target_idx = (int)targets[i];",
-            "        float g_out_val = grad_out[i];",
+            "        float g_out_val = grad_out[i] * inv_B;",  # Normalize gradient by batch size
             "        for (int j = 0; j < F; ++j) {",
             "            float prob = expf(logits[offset+j] - max_l) / sum_e;",
             "            grad_logits[offset + j] = (j == target_idx) ? (prob - 1.0f) : prob;",
@@ -1146,17 +1147,17 @@ class Compiler:
             "                   float32x4_t v_act = vld1q_f32(&gelu_act[h]);", 
             "                   float32x4_t v_gw2 = vmulq_f32(v_act, v_go);", 
             "                   #pragma omp atomic",
-            f"                   gW2[(h+0) * {E} + e] += vgetq_lane_f32(v_gw2, 0);",
+            f"                   gW2[e*{H} + h+0] += vgetq_lane_f32(v_gw2, 0);",
             "                   #pragma omp atomic",
-            f"                   gW2[(h+1) * {E} + e] += vgetq_lane_f32(v_gw2, 1);",
+            f"                   gW2[e*{H} + h+1] += vgetq_lane_f32(v_gw2, 1);",
             "                   #pragma omp atomic",
-            f"                   gW2[(h+2) * {E} + e] += vgetq_lane_f32(v_gw2, 2);",
+            f"                   gW2[e*{H} + h+2] += vgetq_lane_f32(v_gw2, 2);",
             "                   #pragma omp atomic",
-            f"                   gW2[(h+3) * {E} + e] += vgetq_lane_f32(v_gw2, 3);", 
+            f"                   gW2[e*{H} + h+3] += vgetq_lane_f32(v_gw2, 3);", 
             "               }", 
             f"               for(int h={vec_limit_H}; h < {H}; ++h) {{",
             "                   #pragma omp atomic",
-            f"                  gW2[h * {E} + e] += gelu_act[h] * go;",
+            f"                  gW2[h*{E} + e] += gelu_act[h] * go;",
             "               }",
             "           }",
             "           // 3. GELU Backprop & W1/b1 Gradients",
@@ -1270,20 +1271,20 @@ class Compiler:
         compile_cmd += [src_path, "-o", lib_path]
         
         # macOS Detection for OpenMP
-        # import platform
-        # if platform.system() == "Darwin":
-        #     # Apple Clang needs special flags for OpenMP
-        #     compile_cmd += ["-Xpreprocessor", "-fopenmp"]
-        #     compile_cmd += ["-lomp"]
+        import platform
+        if platform.system() == "Darwin":
+            # Apple Clang needs special flags for OpenMP
+            compile_cmd += ["-Xpreprocessor", "-fopenmp"]
+            compile_cmd += ["-lomp"]
             
-        #     # Add Homebrew paths for libomp (Critical for Apple Silicon)
-        #     compile_cmd += ["-I/opt/homebrew/opt/libomp/include"]
-        #     compile_cmd += ["-L/opt/homebrew/opt/libomp/lib"]
-        # else:
-        #     # Linux/Windows (GCC)
-        #     compile_cmd += ["-fopenmp"]
+            # Add Homebrew paths for libomp (Critical for Apple Silicon)
+            compile_cmd += ["-I/opt/homebrew/opt/libomp/include"]
+            compile_cmd += ["-L/opt/homebrew/opt/libomp/lib"]
+        else:
+            # Linux/Windows (GCC)
+            compile_cmd += ["-fopenmp"]
             
-        # compile_cmd += [src_path, "-o", lib_path]
+        compile_cmd += [src_path, "-o", lib_path]
         
         # 4. Run Compiler & Capture Output
         result = subprocess.run(compile_cmd, capture_output=True, text=True)
@@ -1364,20 +1365,20 @@ class Compiler:
         compile_cmd += [src_path, "-o", lib_path]
         
         # # macOS Detection for OpenMP
-        # import platform
-        # if platform.system() == "Darwin":
-        #     # Apple Clang needs special flags for OpenMP
-        #     compile_cmd += ["-Xpreprocessor", "-fopenmp"]
-        #     compile_cmd += ["-lomp"]
+        import platform
+        if platform.system() == "Darwin":
+            # Apple Clang needs special flags for OpenMP
+            compile_cmd += ["-Xpreprocessor", "-fopenmp"]
+            compile_cmd += ["-lomp"]
             
-        #     # Add Homebrew paths for libomp (Critical for Apple Silicon)
-        #     compile_cmd += ["-I/opt/homebrew/opt/libomp/include"]
-        #     compile_cmd += ["-L/opt/homebrew/opt/libomp/lib"]
-        # else:
-        #     # Linux/Windows (GCC)
-        #     compile_cmd += ["-fopenmp"]
+            # Add Homebrew paths for libomp (Critical for Apple Silicon)
+            compile_cmd += ["-I/opt/homebrew/opt/libomp/include"]
+            compile_cmd += ["-L/opt/homebrew/opt/libomp/lib"]
+        else:
+            # Linux/Windows (GCC)
+            compile_cmd += ["-fopenmp"]
             
-        # compile_cmd += [src_path, "-o", lib_path]
+        compile_cmd += [src_path, "-o", lib_path]
         
         # 4. Run Compiler & Capture Output
         result = subprocess.run(compile_cmd, capture_output=True, text=True)

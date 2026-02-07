@@ -162,17 +162,22 @@ class Tensor:
                 b1 = node.inputs[2]
                 W2 = node.inputs[3]
                 b2 = node.inputs[4]
-                if not W2.grad.flags['C_CONTIGUOUS']:
-                    W2.grad = np.ascontiguousarray(W2.grad)
+                H = node.attributes['hidden_dim']
+                E = W2.shape[1] if W2.shape[0] == H else W2.shape[0]
+                gW2_transposed = np.zeros((E, H), dtype=np.float32)
+
                 g_p, _k1 = self._prepare_ptr_array([
-                    X.grad, W1.grad, b1.grad, W2.grad, b2.grad
+                    X.grad, W1.grad, b1.grad, gW2_transposed, b2.grad
                 ])
+                W2_T = np.ascontiguousarray(W2.data.T) if W2.shape[0] == H else np.ascontiguousarray(W2.data)
                 v_p, _k2 = self._prepare_ptr_array([
                     X.data, W1.data, b1.data, 
-                    np.ascontiguousarray(W2.data.T), b2.data
+                    W2_T, b2.data
                 ])
                 grad_out_ptr = node.grad.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
                 func(g_p, v_p, node.shape[0], grad_out_ptr)
+
+                W2.grad += gW2_transposed.T
             elif func_name == "loss_backward":
                 g_p, _k1 = self._prepare_ptr_array([node.inputs[0].grad])
                 v_p, _k2 = self._prepare_ptr_array([node.inputs[0].data, node.inputs[1].data])
@@ -187,10 +192,6 @@ class Tensor:
             
 
             elif node.op_type == Operators.MHA:
-                # CRITICAL FIX: Handle self-attention where Q=K=V=same node.
-                # If inputs share the same node, the kernel writes gQ, gK, gV
-                # to the same pointer → data race under OpenMP.
-                # Solution: allocate separate temp gradient buffers, then sum.
                 
                 q_node, k_node, v_node = node.inputs[0], node.inputs[1], node.inputs[2]
                 

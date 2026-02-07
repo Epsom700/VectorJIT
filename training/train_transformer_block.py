@@ -23,7 +23,7 @@ def test_transformer_small():
     num_heads = 4         # was 8  → head_dim = 16
     hidden_dim = 128      # was 2048
     num_classes = 32      # was 512 (= model_dim)
-    lr = 1e-3
+    lr = 1e-4
     num_epochs = 100
 
     print(f"Config: B={batch_size}, S={seq_len}, E={model_dim}, H={hidden_dim}, heads={num_heads}, classes={num_classes}")
@@ -97,9 +97,10 @@ def test_transformer_small():
                 total_norm += pn ** 2
         total_norm = np.sqrt(total_norm)
 
-        # --- Update (NO clipping — let Adam handle it) ---
         optimizer.clip_gradients(1.0)
         optimizer.step()
+        # optimizer.clip_gradients(1.0)
+
 
         elapsed = (time.time() - start) * 1000
         avg_loss = np.mean(loss.data)
