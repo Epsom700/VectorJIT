@@ -623,88 +623,104 @@ class Compiler:
         ]
         return "\n".join(code)
     
-    def compile_LayerNorm_Backend_SIMD(self, node: Node)-> str: 
+    def compile_LayerNorm_Backend_SIMD(self, node):
+        """Fixed LayerNorm backward with thread-safe reduction."""
         eps = node.attributes.get('eps', 1e-5)
         if len(node.shape) == 2: B, F = node.shape
         else: B = node.shape[0] * node.shape[1]; F = node.shape[2]
         vector_limit = F - (F % 4)
+        
         code = [
-            "#include <arm_neon.h>", "#include <cmath>", "#include <omp.h>", 
-            "", "extern \"C\" void layernorm_backward(float* grad_x, float* grad_gamma, float* grad_beta, float* grad_out, float* x, float* gamma, int B, int F) {", 
-            "   #pragma omp parallel for", 
-            f"   for (int i =0; i < {B}; ++i ){{", 
-            "       float row_sum_grad = 0.0f; float row_sum_grad_xhat = 0.0f;",
-            "       float row_sum_x = 0.0f; float row_sum_xsq = 0.0f;", 
-            "       int offset = i * F;",
-            f"       for (int j = 0; j < {F}; ++j){{", 
-            "           float val = x[offset + j]; row_sum_x += val; row_sum_xsq +=val*val;", 
-            "       }", 
-            f"      float mean = row_sum_x/{F};", 
-            f"      float var = (row_sum_xsq/{F})-(mean*mean);", 
-            f"      float inv_std = 1.0f / sqrtf(var + {eps}f);", 
-            "       float32x4_t  v_sum_grad = vdupq_n_f32(0.0f); float32x4_t  v_sum_grad_xhat = vdupq_n_f32(0.0f);", 
-            "       float32x4_t  v_mean = vdupq_n_f32(mean); float32x4_t v_inv_std = vdupq_n_f32(inv_std);", 
-            "       int j =0; ", 
-            f"       for(; j < {vector_limit}; j +=4){{", 
-            "           float32x4_t v_x = vld1q_f32(&x[offset + j]);",
-            "           float32x4_t v_g_out = vld1q_f32(&grad_out[offset + j]);", 
-            "           float32x4_t v_x_hat = vmulq_f32(vsubq_f32(v_x, v_mean), v_inv_std);", 
-            "           v_sum_grad = vaddq_f32(v_sum_grad, v_g_out);", 
-            "           v_sum_grad_xhat = vfmaq_f32(v_sum_grad_xhat, v_g_out, v_x_hat);", 
-            "           #pragma omp atomic",
-            "           grad_gamma[j] += vgetq_lane_f32(vmulq_f32(v_g_out, v_x_hat), 0);",
-            "           #pragma omp atomic",
-            "           grad_gamma[j+1] += vgetq_lane_f32(vmulq_f32(v_g_out, v_x_hat), 1);",
-            "           #pragma omp atomic",
-            "           grad_gamma[j+2] += vgetq_lane_f32(vmulq_f32(v_g_out, v_x_hat), 2);",
-            "           #pragma omp atomic",
-            "           grad_gamma[j+3] += vgetq_lane_f32(vmulq_f32(v_g_out, v_x_hat), 3);",
-            "           #pragma omp atomic",
-            "           grad_beta[j] += vgetq_lane_f32(v_g_out, 0);",
-            "           #pragma omp atomic",
-            "           grad_beta[j+1] += vgetq_lane_f32(v_g_out, 1);",
-            "           #pragma omp atomic",
-            "           grad_beta[j+2] += vgetq_lane_f32(v_g_out, 2);",
-            "           #pragma omp atomic",
-            "           grad_beta[j+3] += vgetq_lane_f32(v_g_out, 3);",
-            "       }", 
-            "       row_sum_grad = vaddvq_f32(v_sum_grad);", 
-            "       row_sum_grad_xhat = vaddvq_f32(v_sum_grad_xhat);",
-            # =====================================================================
-            # FIX: These lines were regular strings with {F} — now f-strings
-            # =====================================================================
-            f"       for (; j < {F}; ++j) {{",
-            "           float val = x[offset + j]; float g_out = grad_out[offset+j];",
-            "           float x_hat = (val - mean) * inv_std;",
-            "           row_sum_grad += g_out; row_sum_grad_xhat += g_out * x_hat;",
-            "           #pragma omp atomic",
-            "           grad_gamma[j] += g_out * x_hat;",
-            "           #pragma omp atomic",
-            "           grad_beta[j] += g_out;",
+            "#include <arm_neon.h>", "#include <cmath>", "#include <omp.h>",
+            "#include <cstring>",  # for memset
+            "",
+            "extern \"C\" void layernorm_backward(float* grad_x, float* grad_gamma, float* grad_beta,",
+            "                                    float* grad_out, float* x, float* gamma, int B, int F) {",
+            "",
+            "   // Thread-local buffers for gamma/beta gradient reduction",
+            "   int num_threads = omp_get_max_threads();",
+            f"   float local_gg[num_threads][{F}];",  # VLA — fine for F=64
+            f"   float local_gb[num_threads][{F}];",
+            "   for (int t = 0; t < num_threads; ++t) {",
+            f"       memset(local_gg[t], 0, {F} * sizeof(float));",
+            f"       memset(local_gb[t], 0, {F} * sizeof(float));",
+            "   }",
+            "",
+            "   #pragma omp parallel",
+            "   {",
+            "       int tid = omp_get_thread_num();",
+            "       #pragma omp for",
+            f"       for (int i = 0; i < {B}; ++i) {{",
+            "           float row_sum_grad = 0.0f; float row_sum_grad_xhat = 0.0f;",
+            "           float row_sum_x = 0.0f; float row_sum_xsq = 0.0f;",
+            "           int offset = i * F;",
+            f"           for (int j = 0; j < {F}; ++j) {{",
+            "               float val = x[offset + j]; row_sum_x += val; row_sum_xsq += val*val;",
+            "           }",
+            f"           float mean = row_sum_x / {F};",
+            f"           float var = (row_sum_xsq / {F}) - (mean * mean);",
+            f"           float inv_std = 1.0f / sqrtf(var + {eps}f);",
+            "",
+            "           // Pass 2: accumulate into thread-local gamma/beta grads",
+            "           float32x4_t v_sum_grad = vdupq_n_f32(0.0f);",
+            "           float32x4_t v_sum_grad_xhat = vdupq_n_f32(0.0f);",
+            "           float32x4_t v_mean = vdupq_n_f32(mean);",
+            "           float32x4_t v_inv_std = vdupq_n_f32(inv_std);",
+            "           int j = 0;",
+            f"           for (; j < {vector_limit}; j += 4) {{",
+            "               float32x4_t v_x = vld1q_f32(&x[offset + j]);",
+            "               float32x4_t v_g_out = vld1q_f32(&grad_out[offset + j]);",
+            "               float32x4_t v_x_hat = vmulq_f32(vsubq_f32(v_x, v_mean), v_inv_std);",
+            "               v_sum_grad = vaddq_f32(v_sum_grad, v_g_out);",
+            "               v_sum_grad_xhat = vfmaq_f32(v_sum_grad_xhat, v_g_out, v_x_hat);",
+            "               float32x4_t v_gg = vld1q_f32(&local_gg[tid][j]);",
+            "               float32x4_t v_gb = vld1q_f32(&local_gb[tid][j]);",
+            "               vst1q_f32(&local_gg[tid][j], vfmaq_f32(v_gg, v_g_out, v_x_hat));",
+            "               vst1q_f32(&local_gb[tid][j], vaddq_f32(v_gb, v_g_out));",
+            "           }",
+            "           row_sum_grad = vaddvq_f32(v_sum_grad);",
+            "           row_sum_grad_xhat = vaddvq_f32(v_sum_grad_xhat);",
+            f"           for (; j < {F}; ++j) {{",
+            "               float val = x[offset + j]; float g_out = grad_out[offset + j];",
+            "               float x_hat = (val - mean) * inv_std;",
+            "               row_sum_grad += g_out; row_sum_grad_xhat += g_out * x_hat;",
+            "               local_gg[tid][j] += g_out * x_hat;",
+            "               local_gb[tid][j] += g_out;",
+            "           }",
+            "",
+            "           // Pass 3: grad_x (per-row, no race)",
+            "           float32x4_t v_s_grad = vdupq_n_f32(row_sum_grad);",
+            "           float32x4_t v_s_grad_xhat = vdupq_n_f32(row_sum_grad_xhat);",
+            f"           float32x4_t v_F_inv = vdupq_n_f32(1.0f / {F}.0f);",
+            "           j = 0;",
+            f"           for (; j < {vector_limit}; j += 4) {{",
+            "               float32x4_t v_x = vld1q_f32(&x[offset + j]);",
+            "               float32x4_t v_g_out = vld1q_f32(&grad_out[offset + j]);",
+            "               float32x4_t v_gamma = vld1q_f32(&gamma[j]);",
+            "               float32x4_t v_x_hat = vmulq_f32(vsubq_f32(v_x, v_mean), v_inv_std);",
+            f"               float32x4_t v_term1 = vmulq_f32(vmulq_f32(v_gamma, v_inv_std), v_F_inv);",
+            f"               float32x4_t v_term2 = vsubq_f32(vsubq_f32(vmulq_f32(vdupq_n_f32({F}.0f), v_g_out), v_s_grad), vmulq_f32(v_x_hat, v_s_grad_xhat));",
+            "               vst1q_f32(&grad_x[offset + j], vmulq_f32(v_term1, v_term2));",
+            "           }",
+            f"           for (; j < {F}; ++j) {{",
+            "               float x_hat = (x[offset + j] - mean) * inv_std;",
+            f"               float term = ({F} * grad_out[offset + j] - row_sum_grad - x_hat * row_sum_grad_xhat);",
+            f"               grad_x[offset + j] = (gamma[j] * inv_std / {F}) * term;",
+            "           }",
+            "       }",  # end for i
+            "   }",  # end parallel
+            "",
+            "   // Merge thread-local gamma/beta grads (single-threaded, no race)",
+            "   for (int t = 0; t < num_threads; ++t) {",
+            f"       for (int j = 0; j < {F}; ++j) {{",
+            "           grad_gamma[j] += local_gg[t][j];",
+            "           grad_beta[j] += local_gb[t][j];",
             "       }",
-            "       float32x4_t v_s_grad = vdupq_n_f32(row_sum_grad);", 
-            "       float32x4_t v_s_grad_xhat = vdupq_n_f32(row_sum_grad_xhat);", 
-            f"      float32x4_t v_F_inv = vdupq_n_f32(1.0f/{F}.0f);", 
-            "       j = 0;", 
-            f"      for (; j < {vector_limit}; j += 4) {{",
-            "            float32x4_t v_x = vld1q_f32(&x[offset + j]);",
-            "            float32x4_t v_g_out = vld1q_f32(&grad_out[offset + j]);",
-            "            float32x4_t v_gamma = vld1q_f32(&gamma[j]);",
-            "            float32x4_t v_x_hat = vmulq_f32(vsubq_f32(v_x, v_mean), v_inv_std);",
-            f"            float32x4_t v_term1 = vmulq_f32(vmulq_f32(v_gamma, v_inv_std), v_F_inv);",
-            f"            float32x4_t v_term2 = vsubq_f32(vsubq_f32(vmulq_f32(vdupq_n_f32({F}.0f), v_g_out), v_s_grad), vmulq_f32(v_x_hat, v_s_grad_xhat));",
-            "            vst1q_f32(&grad_x[offset + j], vmulq_f32(v_term1, v_term2));",
-            "      }",
-            f"      for (; j < {F}; ++j) {{",
-            "          float x_hat = (x[offset+j] - mean) * inv_std;",
-            f"          float term = ({F} * grad_out[offset+j] - row_sum_grad - x_hat * row_sum_grad_xhat);",
-            f"          grad_x[offset+j] = (gamma[j] * inv_std / {F}) * term;",
-            "      }",
             "   }",
             "}"
         ]
         return "\n".join(code)
-    
+
     def compile_fused_loss_forward(self, node: Node) -> str:
         # Check dimensionality. If 3D (B, S, E), we assume user flattened or we handle 2D.
         # This kernel expects strictly 2D (N, C) inputs where C is classes.
@@ -960,7 +976,7 @@ class Compiler:
             "       vst1q_f32(output+i, gelu_approx);",
             "   }", 
             "    // Scalar cleanup",
-            f"    for (int i = {vec_limit}; i < n; ++i) {{",
+            f"    for (int i = {vec_limit}; i < {total_elements}; ++i) {{",
             "        float x = input[i];",
             "        output[i] = 0.5f * x * (1.0f + tanhf(c1 * (x + a * x * x * x)));",
             "    }",
@@ -1016,7 +1032,7 @@ class Compiler:
             "    }",
             "    ",
             "    // Scalar cleanup",
-            f"    for(int i = {vec_limit}; i < n; ++i) {{",
+            f"    for(int i = {vec_limit}; i < {total_elements}; ++i) {{",
             "        float x = input[i];",
             "        float inner = c1 * (x + a * x * x * x);",
             "        float t = tanhf(inner);",
@@ -1263,28 +1279,23 @@ class Compiler:
         compile_cmd = [
             "c++", "-O0", "-g", "-shared", "-fPIC", "-march=native",
             "-w",  # suppress unknown-pragma warnings
-            "-I/opt/homebrew/opt/libomp/include",  # so #include <omp.h> still resolves
-            # NO -Xpreprocessor -fopenmp  → pragmas become no-ops
-            # NO -lomp                     → no OpenMP runtime linked
-            # NO -L/opt/homebrew/...       → no libomp needed
         ]
-        compile_cmd += [src_path, "-o", lib_path]
         
-        # macOS Detection for OpenMP
-        # import platform
-        # if platform.system() == "Darwin":
-        #     # Apple Clang needs special flags for OpenMP
-        #     compile_cmd += ["-Xpreprocessor", "-fopenmp"]
-        #     compile_cmd += ["-lomp"]
+        # # macOS Detection for OpenMP
+        import platform
+        if platform.system() == "Darwin":
+            # Apple Clang needs special flags for OpenMP
+            compile_cmd += ["-Xpreprocessor", "-fopenmp"]
+            compile_cmd += ["-lomp"]
             
-        #     # Add Homebrew paths for libomp (Critical for Apple Silicon)
-        #     compile_cmd += ["-I/opt/homebrew/opt/libomp/include"]
-        #     compile_cmd += ["-L/opt/homebrew/opt/libomp/lib"]
-        # else:
-        #     # Linux/Windows (GCC)
-        #     compile_cmd += ["-fopenmp"]
+            # Add Homebrew paths for libomp (Critical for Apple Silicon)
+            compile_cmd += ["-I/opt/homebrew/opt/libomp/include"]
+            compile_cmd += ["-L/opt/homebrew/opt/libomp/lib"]
+        else:
+            # Linux/Windows (GCC)
+            compile_cmd += ["-fopenmp"]
             
-        # compile_cmd += [src_path, "-o", lib_path]
+        compile_cmd += [src_path, "-o", lib_path]
         
         # 4. Run Compiler & Capture Output
         result = subprocess.run(compile_cmd, capture_output=True, text=True)
@@ -1297,6 +1308,7 @@ class Compiler:
         # 6. Load Library
         try:
             lib = ctypes.CDLL(lib_path)
+            _loaded_libraries.append(lib)
         except OSError as e:
             print(f"Failed to load library at {lib_path}")
             raise e
@@ -1357,28 +1369,24 @@ class Compiler:
         compile_cmd = [
             "c++", "-O0", "-g", "-shared", "-fPIC", "-march=native",
             "-w",  # suppress unknown-pragma warnings
-            "-I/opt/homebrew/opt/libomp/include",  # so #include <omp.h> still resolves
-            # NO -Xpreprocessor -fopenmp  → pragmas become no-ops
-            # NO -lomp                     → no OpenMP runtime linked
-            # NO -L/opt/homebrew/...       → no libomp needed
         ]
-        compile_cmd += [src_path, "-o", lib_path]
+        #compile_cmd += [src_path, "-o", lib_path]
         
         # # macOS Detection for OpenMP
-        # import platform
-        # if platform.system() == "Darwin":
-        #     # Apple Clang needs special flags for OpenMP
-        #     compile_cmd += ["-Xpreprocessor", "-fopenmp"]
-        #     compile_cmd += ["-lomp"]
+        import platform
+        if platform.system() == "Darwin":
+            # Apple Clang needs special flags for OpenMP
+            compile_cmd += ["-Xpreprocessor", "-fopenmp"]
+            compile_cmd += ["-lomp"]
             
-        #     # Add Homebrew paths for libomp (Critical for Apple Silicon)
-        #     compile_cmd += ["-I/opt/homebrew/opt/libomp/include"]
-        #     compile_cmd += ["-L/opt/homebrew/opt/libomp/lib"]
-        # else:
-        #     # Linux/Windows (GCC)
-        #     compile_cmd += ["-fopenmp"]
+            # Add Homebrew paths for libomp (Critical for Apple Silicon)
+            compile_cmd += ["-I/opt/homebrew/opt/libomp/include"]
+            compile_cmd += ["-L/opt/homebrew/opt/libomp/lib"]
+        else:
+            # Linux/Windows (GCC)
+            compile_cmd += ["-fopenmp"]
             
-        # compile_cmd += [src_path, "-o", lib_path]
+        compile_cmd += [src_path, "-o", lib_path]
         
         # 4. Run Compiler & Capture Output
         result = subprocess.run(compile_cmd, capture_output=True, text=True)
@@ -1389,6 +1397,7 @@ class Compiler:
         
         try:
             lib = ctypes.CDLL(lib_path)
+            _loaded_libraries.append(lib)
         except OSError as e:
             print(f"Failed to load library at {lib_path}")
             raise e
